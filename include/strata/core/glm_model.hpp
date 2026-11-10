@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/spec/window_runtime.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -742,6 +743,11 @@ public:
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                     int64_t& produced, std::string& err);
+    // Prompt lookup uses RAM history and the existing verified window/commit machinery; opt-in.
+    static int lookup_draft_cap();
+    bool decode_lookup(strata::kernels::SamplerParams& sp, const std::vector<int32_t>& prompt,
+                       int64_t max_new, const std::function<bool(int)>& emit,
+                       int64_t& produced, std::string& err);
     uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
@@ -753,6 +759,7 @@ private:
     // (STRATA_GLM_MTP_ACC_WINDOW)
     double mtp_ms_[9] = {};
     uint64_t mtp_seen_[9] = {};
+    strata::spec::WindowRuntime mtp_runtime_;              // recent per-length median; legacy EMA kept for A/B
     double mtp_reach_[9] = {}, mtp_hit_[9] = {};
     uint64_t mtp_round_no_ = 0;
     int mtp_best_ = -1;                                    // the length in use, the probe gap and the next probe
@@ -796,6 +803,8 @@ public:
         cudaEvent_t ev_hop = nullptr;
         float* emb_h = nullptr;
         int* tok_h = nullptr;
+        float* emb_hd = nullptr;   // device aliases of this sequence's own pinned buffers
+        int* tok_hd = nullptr;
         cudaEvent_t ev_done = nullptr;
         KvStream* kv = nullptr;   // KV streaming: its latent caches' host copy and maps (null: not streamed, or bound)
     };
@@ -1008,7 +1017,7 @@ public:
         bool adapted = false;           // the default reserve lowered so the pool holds its floor
     };
     static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
-                                  bool unified = false);
+                                  bool unified = false, int device = -1);
     PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
     size_t pool_short_ = 0;                                // what that check found short of the reserve

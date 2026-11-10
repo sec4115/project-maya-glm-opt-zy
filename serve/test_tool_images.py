@@ -29,7 +29,7 @@ def request(content):
 class ToolImages(unittest.TestCase):
     def test_image_only_result(self):
         messages, _, _ = anthropic_to_messages(request([image()]))
-        self.assertEqual(messages[-1], {"role": "tool", "content": [
+        self.assertEqual(messages[-1], {"role": "tool", "tool_call_id": "toolu_1", "content": [
             {"type": "image", "source": "data:image/png;base64,Ymx1ZQ=="}]})
         self.assertEqual(images_of(messages), ["data:image/png;base64,Ymx1ZQ=="])
 
@@ -37,7 +37,7 @@ class ToolImages(unittest.TestCase):
         for content in ("plain", [{"type": "text", "text": "plain"}]):
             with self.subTest(content=content):
                 messages, _, _ = anthropic_to_messages(request(content))
-                self.assertEqual(messages[-1], {"role": "tool", "content": "plain"})
+                self.assertEqual(messages[-1], {"role": "tool", "tool_call_id": "toolu_1", "content": "plain"})
                 self.assertEqual(images_of(messages), [])
 
     def test_text_and_image_order(self):

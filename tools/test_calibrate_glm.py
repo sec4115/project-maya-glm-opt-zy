@@ -120,6 +120,40 @@ class DiskEngine(FakeEngine):
 
 
 class ReadChunks(unittest.TestCase):
+    def test_observed_reads_are_bounded_and_missing_stats_are_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "engine.log"
+            self.assertIsNone(CAL.observed_disk_reads(str(log)))
+            log.write_text("glm stat: disk 2.00 reads/tok\n" + "padding\n" * 10000 +
+                           "glm stat: disk 0.00 reads/tok\n", encoding="utf-8")
+            self.assertFalse(CAL.observed_disk_reads(str(log)))
+            log.write_text("warming the model\n", encoding="utf-8")
+            self.assertIsNone(CAL.observed_disk_reads(str(log)))
+
+    def test_observed_reads_exclude_an_earlier_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "engine.log"
+            old = "glm stat: decode 50 ms/tok | disk 2.00 reads/tok\n"
+            log.write_text(old + "glm stat: decode 30 ms/tok | disk 0.00 reads/tok\n", encoding="utf-8")
+            self.assertTrue(CAL.observed_disk_reads(str(log)))
+            self.assertFalse(CAL.observed_disk_reads(str(log), len(old.encode("utf-8"))))
+
+    def test_observed_reads_override_inflated_slot_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "engine.log"
+
+            class LoggedDiskEngine(DiskEngine):
+                def generate(self, ids, max_new, sampling, cancel):
+                    with log.open("a", encoding="utf-8") as f:
+                        f.write("glm stat: decode 50 ms/tok | disk 0.40 reads/tok in 1 waits/tok\n")
+                    return super().generate(ids, max_new, sampling, cancel)
+
+            eng = LoggedDiskEngine(lambda s, t, c: 20 * (1.15 if c == 4 else 1), held=14000)
+            res = CAL.measure({"env": {}, "log": str(log)}, [[1, 2, 3]] * 3,
+                              lambda cfg: eng, say=lambda *a: None)
+            self.assertTrue(res["report"]["disk_reads_observed"])
+            self.assertEqual(res["settings"], {CAL.CHUNKS_ENV: "4"})
+
     def test_a_faster_read_size_is_kept(self):
         # a Windows laptop on an Intel RST RAID (#67): 4 pieces 15% faster than the engine's 8
         eng = DiskEngine(lambda s, t, c: 14.5 * (1.15 if c == 4 else 1.0))

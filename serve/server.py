@@ -61,6 +61,7 @@ from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 from serve.response_store import StoreBusy  # noqa: E402
 from serve.update import RESTART_EXIT, Updater  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
+from serve.responses import codex_model_info  # noqa: E402
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
@@ -357,6 +358,24 @@ def check_request_sampling(req: dict) -> None:
             raise ValueError(what)
     if isinstance(req.get("penalty_last_n"), int) and req["penalty_last_n"] < -1:
         raise ValueError(f"{window_key}: -1 (the whole context), 0 (no penalties) or a positive number of tokens")
+
+
+def request_think_budget(req: dict | None, default: int) -> int:
+    """Per-request budget, shared by both dialects; zero is only a server default.
+
+    Anthropic's numeric budget and the local OpenAI `thinking_budget` extension
+    control the engine, independently of the template's qualitative effort level.
+    """
+    req = req or {}
+    thinking = req.get("thinking")
+    value = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
+    if value is None:
+        value = req.get("thinking_budget")
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("thinking budget must be a positive integer")
+    return value
 
 
 def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
@@ -1480,10 +1499,11 @@ class Detokenizer:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 strata_tune_defaults: dict | None = None, fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.strata_tune_defaults = dict(strata_tune_defaults or {})   # the config's `strata_default_tune`
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
@@ -1551,6 +1571,7 @@ class Service:
         line takes, before anything is sent.  A logit_bias needs an engine that applies it (INFO logit_bias=1): an
         older one would answer as if it had none."""
         check_request_sampling(req)
+        request_think_budget(req, self.think_budget)
         bias = logit_bias_of(req.get("logit_bias"), len(getattr(self.tok, "tokens", None) or ()) or None)
         if bias and (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
             raise ValueError("logit_bias: this engine does not apply token biases - update Maya (./maya.sh --setup)")
@@ -2220,12 +2241,18 @@ class Service:
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
-    def count_tokens(self, req: dict) -> dict:
+    def count_tokens(self, req: dict, api: str = "openai") -> dict:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
         tools and tokenizer as prepare(), with nothing run (no image encoder: a picture counts as its marker, so the
         count is approximate then).  The web app's context meter."""
-        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False))
-        kw = {k: v for k, v in kw.items() if k != "_force_tool"}
+        req = self.with_shared(req, api)
+        messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(self.template, "deepseek", False)) if api == "anthropic" else openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False))
+        force = kw.pop("_force_tool", None)
+        suffix = ""
+        if force is not None and tools:
+            kw["enable_thinking"] = False
+            suffix = CALL_START + (force if "<arg_key>" in self.template.source else
+                                   "\n" + (f"<function={force}>\n" if force else ""))
         if req.get("strata_mcp") is True and self.mcp is not None:
             own = {t.get("name") for t in tools or []}
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
@@ -2233,7 +2260,9 @@ class Service:
             kw = {**kw, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
                                   else effort_kwargs(self.default_effort))}
         sources = deepseek_images(messages) if getattr(self.template, "deepseek", False) else images_of(messages)
-        n, approximate = len(self.render_ids(messages, tools, kw)), len(sources) > 0
+        if api == "anthropic" and sources:
+            raise ValueError("image token counting is not supported; text and tool token counting is available")
+        n, approximate = len(self.render_ids(messages, tools, kw, suffix)), len(sources) > 0
         if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
             try:
                 n += sum(self.vision.picture(src).tokens - 1 for src in sources)
@@ -2405,6 +2434,15 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if self.strata_tune_defaults:  # the config's engine tuning (e.g. the DFlash verify window): the request's
+            req_tune = (sampling or {}).get("strata_tune") if isinstance(sampling, dict) else None
+            tune = {**self.strata_tune_defaults}
+            if isinstance(req_tune, dict):
+                tune.update({k: v for k, v in req_tune.items() if v is not None})   # ... own keys win
+            sampling = dict(sampling or {})
+            sampling["strata_tune"] = tune
+        think_budget = request_think_budget(sampling, self.think_budget)
+        in_think = bool(thinking) and self.think_end_id is not None and think_budget > 0
         responses = (sampling or {}).get("_responses") is True
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
@@ -2413,7 +2451,7 @@ class Service:
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
-        reasoning_tokens = 0
+        reasoning_tokens, effective_think_budget = 0, 0
         held = ""                                       # text that may be the start of a stop marker (stop_texts)
         # the client's own stop strings (OpenAI "stop", Anthropic "stop_sequences"): the answer ends before one.  They
         # apply to the answer, not inside the reasoning; the model's own end-of-turn markers apply everywhere
@@ -2426,6 +2464,7 @@ class Service:
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
         counted, my_started, my_first, queued = False, time.time(), None, False
+        enqueued_at, queue_ms = time.monotonic(), None
         with self.status_lock:
             self.status["queued"] += 1
             queued = True                               # counted as waiting until its turn comes (below, or in finally)
@@ -2433,6 +2472,7 @@ class Service:
         asked = time.monotonic()
         try:
             with self._turn(hold, cancel):
+                queue_ms = round((time.monotonic() - enqueued_at) * 1000, 1)
                 with self.status_lock:
                     self.status["queued"] -= 1
                     queued = False
@@ -2460,16 +2500,18 @@ class Service:
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
-                in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
                 # never let the reasoning use the whole output: a request whose max_tokens is reached while still
-                # thinking ends with no answer at all.  The budget is clamped to leave a quarter of max_tokens (at
-                # least 1024 tokens) for the answer; STRATA_GLM_THINK_RESERVE=<tokens> sets that floor
-                think_budget = self.think_budget
+                # thinking ends with no answer at all. Reserve a quarter for the answer, with a preferred floor
+                # of 1024 (STRATA_GLM_THINK_RESERVE). The floor cannot take more than half of a small output limit:
+                # the old unconditional floor reduced every limit <=1024 to ONE reasoning token. The forced
+                # </think> also consumes one token of max_new, so account for it before assigning the budget.
                 if in_think and max_new:
-                    reserve = max(int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024), int(max_new) // 4)
-                    think_budget = max(1, min(think_budget, int(max_new) - reserve))
+                    reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
+                    reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
+                    think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
+                    effective_think_budget = think_budget
 
                 def attempts():
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
@@ -2512,7 +2554,7 @@ class Service:
                             finish = "stop"
                             raw_ids.append(t)
                             break
-                        if parser.state == "reasoning":
+                        if parser.state == "reasoning" and t != self.think_end_id:
                             reasoning_tokens += 1
                         raw_ids.append(t)
                         text, stopped = detok.push(t), False
@@ -2590,6 +2632,9 @@ class Service:
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "api": (sampling or {}).get("_api"),
+                        "queue_ms": queue_ms,
+                        "first_token_ms": round((my_first - my_started) * 1000, 1) if my_first else None,
+                        "thinking_budget": effective_think_budget,
                         "prefill_tok_s": round((len(ids) - (last.get("reused") or 0)) / (last["prompt_ms"] / 1000), 1)
                         if last.get("prompt_ms") and len(ids) > (last.get("reused") or 0) else None,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
@@ -2615,8 +2660,11 @@ class Service:
                     ft = my_first or (self.status.get("first_token") if self.active <= 1 else None)
                     rate = n / max(1e-6, now - ft) if ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                    latency_msg = f", queue {queue_ms:.1f} ms, first token {(ft - started) * 1000:.1f} ms" if ft else \
+                                  f", queue {queue_ms:.1f} ms"
                     print(f"[maya] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                          f"({finish}, cancel={cancel.is_set()}){hit_msg}{latency_msg}, "
+                          f"thinking budget {effective_think_budget}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[maya] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 if queued:                              # never started (a cancel, an error while waiting): not waiting now
@@ -2844,6 +2892,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
+                             "completion_tokens_details": {"reasoning_tokens": x.get("reasoning_tokens", 0)},
                              # the part of the prompt the conversation cache already held (OpenAI's field)
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
@@ -2851,12 +2900,19 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield last
 
 
-def carry_embeddings(local, path, chunks):
+def carry_embeddings(local, path, chunks, first=None):
     """`Service.embeddings` is thread-local (the request thread prepares the prompt and sets the image embeddings
     file).  A strata_resume answer runs its chunks on the job thread, which would see no file: the image's place
     in the prompt then went to the engine as plain pad tokens and the model answered about a black / blank picture."""
     local.path = path                                  # runs on the thread that first pulls from the generator
-    yield from chunks
+    try:
+        if first is not None:
+            yield first
+        yield from chunks
+    finally:
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
 
 
 def watch_client(handler, cancel: threading.Event, every: float = 0.5) -> None:
@@ -2893,11 +2949,13 @@ class StreamJob:
     sleeps mid-answer reconnects and carries on instead of losing it.  Only POST /v1/strata/cancel (the app's Stop)
     cancels it - a dropped connection does not."""
 
+    MAX_BUFFER_BYTES = 32 * 1024 * 1024
     ORPHAN_S = 300   # a running answer nobody has read for this long (the page was closed) is cancelled
 
     def __init__(self, jid: str, chunks, cancel: threading.Event):
         self.id, self.cancel = jid, cancel
-        self.items: list = []
+        self.items: list[bytes] = []
+        self.buffer_bytes = 0
         self.done, self.ended = False, None
         self.readers, self.unread_since = 0, time.time()
         self.cv = threading.Condition()
@@ -2921,30 +2979,45 @@ class StreamJob:
                 return
 
     def _add(self, c):
+        frame = b"data: " + json.dumps(c, ensure_ascii=False).encode("utf-8") + b"\n\n"
         with self.cv:
-            self.items.append(c)
+            # Include Python object and list overhead, and reserve a terminal error frame.
+            cost = sys.getsizeof(frame) + 16
+            if self.buffer_bytes + cost > self.MAX_BUFFER_BYTES - 512:
+                self.cancel.set()
+                frame = b'data: {"error":{"type":"server_error","message":"Resumable stream buffer limit exceeded"}}\n\n'
+                self.items.append(frame)
+                self.buffer_bytes += sys.getsizeof(frame) + 16
+                self.cv.notify_all()
+                return False
+            self.items.append(frame)
+            self.buffer_bytes += cost
             self.cv.notify_all()
+            return True
 
     def _run(self, chunks):
         try:
             for c in chunks:
-                if c is not None:                      # heartbeats: each reader writes its own
-                    self._add(c)
+                if c is not None and not self._add(c):
+                    break
         except EngineDied as e:
             self._add({"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
-        except Exception as e:  # noqa: BLE001 - the engine's ERR after the stream started, or anything else
+        except Exception as e:
             self._add({"error": {"type": "server_error", "message": str(e)}})
         finally:
-            with self.cv:
-                self.done, self.ended = True, time.time()
-                self.cv.notify_all()
+            try:
+                chunks.close()
+            finally:
+                with self.cv:
+                    self.done, self.ended = True, time.time()
+                    self.cv.notify_all()
 
     def wait(self, n: int, timeout: float):
         """The items from index n (waiting up to `timeout` for one) and whether the answer is complete."""
         with self.cv:
             if len(self.items) <= n and not self.done:
                 self.cv.wait(timeout)
-            return self.items[n:], self.done
+            return self.items[n:n + 256], self.done
 
 
 JOBS: dict[str, StreamJob] = {}
@@ -3199,6 +3272,8 @@ def make_handler(svc: Service):
             return self.rfile.read(length)
 
         def _json(self, code, obj):
+            if code >= 400 and self.path.split("?")[0].startswith("/v1/messages") and "error" in obj:
+                obj = {"type": "error", **obj}
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -3431,7 +3506,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
+                                 "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec, "capabilities": {},
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
@@ -3470,12 +3545,13 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    model = {"id": svc.model, "object": "model",
+                    model = {"id": svc.model, "object": "model", "created": 0, "owned_by": "local",
                              "status": {"value": "loaded" if loaded else "unloaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
-                    self._json(200, {"object": "list", "data": [model] if loaded or svc.unloaded else []})
+                    self._json(200, {"object": "list", "data": [model] if loaded or svc.unloaded else [],
+                                     "models": [codex_model_info(svc.model, svc.engine.max_context, svc.vision is not None)] if loaded or svc.unloaded else []})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -3528,7 +3604,11 @@ def make_handler(svc: Service):
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
                     return
-                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
+                if path == "/v1/messages/count_tokens":
+                    svc.check_request(req)
+                    self._json(200, {"input_tokens": svc.count_tokens(req, "anthropic")["tokens"]})
+                    return
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
                     why = ("Project Maya is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
@@ -3778,8 +3858,8 @@ def make_handler(svc: Service):
             if req.get("strata_resume") is True:
                 # the web app: the answer runs on if the connection drops; the page reconnects to it by id
                 first = next(chunks)
-                job = StreamJob(first["id"], itertools.chain(
-                    [first], carry_embeddings(svc.embeddings, getattr(svc.embeddings, "path", None), chunks)), cancel)
+                job = StreamJob(first["id"], carry_embeddings(
+                    svc.embeddings, getattr(svc.embeddings, "path", None), chunks, first), cancel)
                 jobs_put(job)
                 self._sse()
                 self._stream_job(job, 0)
@@ -3812,7 +3892,7 @@ def make_handler(svc: Service):
                     if not items and not done:
                         self.wfile.write(b": keep-alive\n\n")
                     for c in items:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        self.wfile.write(c)
                     n += len(items)
                     self.wfile.flush()
                     if done and n >= len(job.items):
@@ -3849,6 +3929,7 @@ def make_handler(svc: Service):
             if job is not None:
                 job.cancel.set()
             self._json(200, {"cancelled": job is not None})
+
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
@@ -3912,7 +3993,7 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
-              "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
+              "STRATA_SERVER_LOG", "STRATA_PREFIX_CANONICAL_TOOLS", "STRATA_GLM_THINK_RESERVE") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
@@ -4077,6 +4158,46 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             out[key] = value
         else:
             print(f"[maya] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+    return out
+
+
+def strata_tune_defaults_from_config(cfg: dict) -> dict:
+    """The run config's optional `strata_default_tune` block: the engine-tuning keys a request's strata_tune
+    carries (spec, spec_n_min, spec_min_p, spec_cum, pcie_frac, cpu_threads, read_chunks, miss_skip_w,
+    miss_skip_from), sent with every request whose strata_tune leaves a key out - so a plain client gets
+    configured engine tuning without restarting the engine per request.  The request's own keys always win;
+    a bad value refuses to start the server (a typo'd config should not quietly change engine tuning)."""
+    out = {}
+    for key, value in (cfg.get("strata_default_tune") or {}).items():
+        bad = f"[maya] config strata_default_tune.{key}={value!r}"
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if key == "spec":
+            if not number or value != int(value) or not 1 <= value <= 16:
+                raise SystemExit(f"{bad}: expected an integer 1..16 (1: no drafting, 2..16: the verify window)")
+            out[key] = int(value)
+        elif key == "spec_n_min":
+            if not number or value != int(value) or not 0 <= value <= 15:
+                raise SystemExit(f"{bad}: expected an integer 0..15")
+            out[key] = int(value)
+        elif key in ("spec_min_p", "spec_cum", "pcie_frac", "miss_skip_w"):
+            if not number or not 0.0 <= float(value) <= 1.0:
+                raise SystemExit(f"{bad}: expected a number 0..1")
+            out[key] = float(value)
+        elif key == "miss_skip_from":
+            if not number or value != int(value) or not 0 <= value <= 1000:
+                raise SystemExit(f"{bad}: expected an integer 0..1000")
+            out[key] = int(value)
+        elif key == "cpu_threads":
+            if not number or value != int(value) or value < 1:
+                raise SystemExit(f"{bad}: expected an integer >= 1")
+            out[key] = int(value)
+        elif key == "read_chunks":
+            if not number or value != int(value) or not 1 <= value <= 16:
+                raise SystemExit(f"{bad}: expected an integer 1..16")
+            out[key] = int(value)
+        else:
+            raise SystemExit(f"{bad}: unknown key (supported: spec, spec_n_min, spec_min_p, spec_cum, pcie_frac, "
+                             "cpu_threads, read_chunks, miss_skip_w, miss_skip_from)")
     return out
 
 
@@ -4256,6 +4377,10 @@ def main() -> int:
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[maya] sampling defaults from the config: {pretty}", flush=True)
+        strata_tune_defaults = strata_tune_defaults_from_config(cfg)
+        if strata_tune_defaults:
+            pretty = ", ".join(f"{k}={v}" for k, v in strata_tune_defaults.items())
+            print(f"[maya] strata_tune defaults from the config: {pretty}", flush=True)
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
@@ -4310,6 +4435,7 @@ def main() -> int:
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+        strata_tune_defaults = {}
     # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
     # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
     # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
@@ -4324,7 +4450,7 @@ def main() -> int:
             tpl = glm5
     svc = Service(engine, tok, ChatTemplate(tpl),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
-                  sampling_defaults=sampling_defaults,
+                  sampling_defaults=sampling_defaults, strata_tune_defaults=strata_tune_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)

@@ -423,12 +423,12 @@ path runs through the MLA attention kernels and their parity harness.
   `glm_model_test`); `iq_pack.py`'s glm5-next support (`tools/test_iq_pack_glm.py`) and the
   glm4/glm5 pre-tokenizer in `strata_tokenizer` (`tools/test_tokenizer_glm.py`).
 
-A note on running the kernel parity tests on a 2x V100 machine (Mercury): its GPUs are V100s (sm_70), BELOW
-the engine's sm_75 minimum, so the prebuilt archs produce binaries the V100 cannot launch ("no kernel
-image"). The kernel sources themselves are arch-portable (the sm_80 features have the fp32 fallback),
-so the local test tree relaxes the configure guard one line (`sed -i 's/_base LESS 75/_base LESS 70/'`)
-and configures with `-DCMAKE_CUDA_ARCHITECTURES=70` - an uncommitted, build-tree-local change that
-exists only to let the V100s execute the parity suite.
+A note on running the kernel parity tests on a 2x V100 machine (Mercury): its GPUs are V100s (sm_70).
+The GLM kernels support Volta: the sm_80 QSA scorer has an fp32 fallback and tensor-core prompt kernels
+decline unsupported paths. CMake and the runtime device guard now accept sm_70. Build with CUDA 12.x,
+which can emit sm_70 code; CUDA 13.x no longer supports offline compilation for Volta. For a mixed
+Volta/Blackwell machine, configure both architectures (for example `-DCMAKE_CUDA_ARCHITECTURES=70;120`)
+with a toolkit that supports both, and validate every selected device before serving.
 
 ### 8.1 Offset-width audit (second-opinion item 7, 2026-10-03)
 

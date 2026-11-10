@@ -99,9 +99,13 @@ class Proc:
         return False
 
     def close(self):
+        children = descendants(self.p.pid) if psutil is not None else []
         if self.p.poll() is None:
             self.p.kill()
         self.p.wait(timeout=30)
+        if children:
+            kill_all(children)
+            gone(children, timeout=5)
         for f in (self.p.stdin, self.p.stdout):
             if f is not None:
                 try:

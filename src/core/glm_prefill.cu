@@ -17,6 +17,8 @@
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
+#include "glm_memory.hpp"
+#include "strata/core/prefill_cpu.hpp"
 
 #include "strata/core/exl3_mma_rows.hpp"
 #include "strata/core/prefill_chunks.hpp"
@@ -1760,7 +1762,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 if (rs < 0) return false;
                 const int old = R.key[(size_t) rs];
                 upd(F->rtab_key((size_t) old), 0ull);
-                F->ram_of[(size_t) old] = -1;
+                F->set_ram_of((size_t) old, -1);
                 F->left[(size_t) old] = 4;
                 ++F->diag_lend_evict;
             }
@@ -1774,7 +1776,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             R.key[(size_t) rs] = key;
             R.tick[(size_t) rs] = F->clock;
             R.st[(size_t) rs] = FastState::kRHold;
-            F->ram_of[(size_t) key] = rs;
+            F->set_ram_of((size_t) key, rs);
             parked[(size_t) key] = 1;
             upd(F->rtab_key((size_t) key), (unsigned long long) (R.slot((size_t) rs)));
             ++F->diag_lend_park;
@@ -1819,16 +1821,16 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                                                                      F->cs), "glm lending relocation", err))
                             return false;
                         upd(F->tab_key((size_t) vkey), 0ull);
-                        F->slot_of[(size_t) vkey] = -1;
+                        F->set_slot_of((size_t) vkey, -1);
                         if (!parked) F->left[(size_t) vkey] = 3;
                         upd(F->tab_key((size_t) key), (unsigned long long) P.slot_ptr(v));
-                        F->slot_of[(size_t) key] = v;
+                        F->set_slot_of((size_t) key, v);
                         P.key[(size_t) v] = P.key[(size_t) s];
                         P.tick[(size_t) v] = P.tick[(size_t) s];
                         ++moved;
                     } else {
                         upd(F->tab_key((size_t) key), 0ull);
-                        F->slot_of[(size_t) key] = -1;
+                        F->set_slot_of((size_t) key, -1);
                         if (!park(il, s, key)) F->left[(size_t) key] = 3;
                         if (!ok) return false;
                     }
@@ -2339,8 +2341,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    const char* small_env = glmfast::device_memory_env("STRATA_GLM_PREFILL_CPU_SMALL", dev_);
+    const int small_limit = small_env ? std::clamp(std::atoi(small_env), 0, 8192) : 0;
+    // 1.1.50 cost gate, retaining this fork's explicit small-batch exception.
+    static const double pf_cpu_gate = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_CPU_GATE");
+        if (!v) return 2.0;
+        char* end = nullptr;
+        const double gate = std::strtod(v, &end);
+        return end != v && *end == '\0' && std::isfinite(gate) && gate >= 0.0 ? gate : 2.0;
+    }();
     const auto cpu_lane = [&](int il) {
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
+        return prefill_cpu_eligible(pf_cpu, F->cpu_pool != nullptr, F->cpu_c_ms, F->cpu_p_ms, T, small_limit, pf_cpu_gate) &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
@@ -4215,6 +4227,12 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
     const int64_t nn = (int64_t) tokens.size();
+    // Opt-in cap for medium prompts: use the existing multi-part pipeline, with the same buffer lifecycle.
+    // Never increases --prefill's allocation ceiling or overrides a caller's forced chunk.
+    if (split_next_ != nullptr && prefill_force_chunk <= 0) {
+        const char* cap = getenv("STRATA_GLM_PREFILL_PIPE_CHUNK");
+        if (cap && std::atoi(cap) >= 256) Tmax = std::min(Tmax, std::atoi(cap));
+    }
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s).
     // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)

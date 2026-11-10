@@ -4,8 +4,37 @@
 #undef NDEBUG   // the checks are asserts: keep them in Release builds
 #include <cassert>
 #include <cstdio>
+#include <cstring>
+
+static void test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
 
 int main() {
+    using strata::core::glmfast::device_memory_env;
+    test_env("STRATA_GLM_POOL_GB", nullptr);
+    test_env("STRATA_GLM_POOL_GB0", nullptr);
+    test_env("STRATA_GLM_POOL_GB1", nullptr);
+    assert(device_memory_env("STRATA_GLM_POOL_GB", 1) == nullptr);
+    test_env("STRATA_GLM_POOL_GB", "24");
+    test_env("STRATA_GLM_POOL_GB1", "11.3");
+    assert(std::strcmp(device_memory_env("STRATA_GLM_POOL_GB", 0), "24") == 0);
+    assert(std::strcmp(device_memory_env("STRATA_GLM_POOL_GB", 1), "11.3") == 0);
+    assert(std::strcmp(device_memory_env("STRATA_GLM_POOL_GB", -1), "24") == 0);
+    test_env("STRATA_GLM_POOL_GB1", nullptr);
+    assert(std::strcmp(device_memory_env("STRATA_GLM_POOL_GB", 1), "24") == 0);
+    test_env("STRATA_GLM_POOL_GB", nullptr);
+    test_env("STRATA_GLM_RESERVE_MB", nullptr);
+    test_env("STRATA_GLM_RESERVE_MB0", nullptr);
+    test_env("STRATA_GLM_RESERVE_MB1", "128");
+    assert(device_memory_env("STRATA_GLM_RESERVE_MB", 0) == nullptr);
+    assert(std::strcmp(device_memory_env("STRATA_GLM_RESERVE_MB", 1), "128") == 0);
+    test_env("STRATA_GLM_RESERVE_MB1", nullptr);
     using strata::core::glmfast::expert_pool_budget;
     using strata::core::glmfast::minimal_ram_tier;
     using strata::core::glmfast::full_unified_pool;

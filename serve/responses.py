@@ -96,7 +96,7 @@ def input_page(items, query):
             "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None}
 
 
-def normalize_request(req):
+def _normalize_functions(req):
     """Responses -> a checked Chat-style request, then the existing template representation.
 
     The template represents tool results by order, so validate call IDs here and reorder
@@ -104,7 +104,8 @@ def normalize_request(req):
     """
     allowed = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning",
                "max_output_tokens", "temperature", "top_p", "stream", "store", "metadata", "previous_response_id",
-               "background", "text", "truncation", "include", "service_tier", "prompt_cache_key", "client_metadata"}
+               "background", "text", "truncation", "include", "service_tier", "prompt_cache_key", "client_metadata",
+               "thinking_budget"}
     for key in req:
         if key not in allowed:
             raise ValueError(f"unsupported Responses parameter: {key}")
@@ -256,7 +257,8 @@ def normalize_request(req):
     instruction = validation.prompt()
     if instruction:
         messages.insert(0, {"role": "system", "content": instruction})
-    normalized = {k: req[k] for k in ("temperature", "top_p", "reasoning", "stream", "parallel_tool_calls") if k in req}
+    normalized = {k: req[k] for k in ("temperature", "top_p", "reasoning", "stream", "parallel_tool_calls",
+                                     "thinking_budget") if k in req}
     normalized.update(messages=messages, tools=tools, tool_choice=choice, _response_validation=validation)
     if "max_output_tokens" in req:
         normalized["max_completion_tokens"] = req["max_output_tokens"]
@@ -286,7 +288,7 @@ def response_usage(data, prompt_tokens):
             "output_tokens_details": {"reasoning_tokens": data.get("reasoning_tokens", 0)}}
 
 
-def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=None, validation=None, cancel=None):
+def _function_events(model, req, run, prompt_tokens=0, persist=None, response_id=None, validation=None, cancel=None):
     """Serialize engine events directly, with one item lifecycle and one terminal response event."""
     response = new_response(model, req, response_id)
     if validation is not None:
@@ -441,3 +443,39 @@ def response_collect(events):
         raise ValueError("generation ended without a terminal response")
     finally:
         events.close()
+
+
+def normalize_request(req):
+    from serve.response_tools import expand_request
+    expanded, _ = expand_request(req)
+    return _normalize_functions(expanded)
+
+
+def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=None, validation=None, cancel=None):
+    from serve.response_tools import expand_request, restore_events, restore_response
+    expanded, mapping = expand_request(req)
+    save = (lambda response: persist(restore_response(response, req, mapping))) if persist is not None else None
+    events = _function_events(model, expanded, run, prompt_tokens, save, response_id, validation, cancel)
+    return restore_events(events, req, mapping)
+
+
+def codex_model_info(model: str, context: int, vision: bool) -> dict:
+    """Local capabilities for Codex's model catalog, alongside OpenAI's data list."""
+    return {"slug": model, "display_name": model, "description": "Local Maya model",
+            "default_reasoning_level": "high", "supported_reasoning_levels": [
+                {"effort": e, "description": d} for e, d in
+                [("none", "No thinking"), ("low", "Low"), ("medium", "High"), ("high", "High"),
+                 ("xhigh", "Maximum")]],
+            "shell_type": "unified_exec", "visibility": "list", "supported_in_api": True,
+            "priority": 0, "upgrade": None, "model_messages": None,
+            "base_instructions": "You are a helpful coding assistant. Follow the user's instructions and use the provided tools when needed.",
+            "experimental_supported_tools": [], "additional_speed_tiers": [], "service_tiers": [],
+            "include_skills_usage_instructions": False, "include_plugin_usage_instructions": False,
+            "include_apps_usage_instructions": False,
+            "support_verbosity": False, "default_reasoning_summary": "none",
+            "apply_patch_tool_type": "freeform", "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "context_window": context, "max_context_window": context,
+            "effective_context_window_percent": 95, "supports_search_tool": False,
+            "supports_image_detail_original": False, "supports_experimental_context": False,
+            "use_responses_lite": False,
+            "input_modalities": ["text", "image"] if vision else ["text"]}

@@ -915,10 +915,12 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
         return fail("KV streaming: the residency maps did not allocate");
     }
     K->host.assign((size_t) g_.n_layers + 1, nullptr);
+    K->cpu.assign((size_t) g_.n_layers + 1, nullptr);
     K->map.assign((size_t) g_.n_layers + 1, k::KvStreamMap{});
     for (size_t i = 0; i < ls.size(); ++i) {
         const size_t il = (size_t) ls[i];
         K->host[il] = d + i * layer_bytes;
+        K->cpu[il] = K->host_arena + i * layer_bytes;
         uint8_t* at = (uint8_t*) K->map_arena + i * per;
         const auto take = [&](uint64_t n) {
             int32_t* r = (int32_t*) at;
@@ -1762,7 +1764,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         }
         const double room =
             c.free > used ? (double) Glm5Model::pool_budget((size_t) (c.free - used), (size_t) c.total, i,
-                                                            (size_t) ((double) keep * ssum), (size_t) smax).avail
+                                                            (size_t) ((double) keep * ssum), (size_t) smax, false, c.dev).avail
                           : 0.0;
         Eval ev;
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;

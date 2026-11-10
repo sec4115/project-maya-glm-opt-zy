@@ -16,13 +16,13 @@ namespace strata::core {
 
 /// The sizes of the groups `ready` requests go in, in order (each 1..k, summing to `ready`); `active` requests run in
 /// all (ready and in flight), k >= 1.  even = false: groups of k and the rest (the old rule).
-inline std::vector<int> split_groups(int ready, int active, int k, bool even) {
-    std::vector<int> out;
-    if (ready <= 0) return out;
+inline void split_groups(int ready, int active, int k, bool even, std::vector<int>& out) {
+    out.clear();
+    if (ready <= 0) return;
     k = std::max(1, k);
     if (!even) {
         for (int left = ready; left > 0; left -= k) out.push_back(std::min(k, left));
-        return out;
+        return;
     }
     active = std::max(active, ready);
     const int groups = active <= 1 ? 1 : std::max(2, (active + k - 1) / k);
@@ -30,6 +30,11 @@ inline std::vector<int> split_groups(int ready, int active, int k, bool even) {
     // the ready ones in ceil(ready / size) groups, the sizes differing by one at most (7 at size 3: 3 2 2)
     const int n = (ready + size - 1) / size;
     for (int i = 0; i < n; ++i) out.push_back(ready / n + (i < ready % n ? 1 : 0));
+}
+
+inline std::vector<int> split_groups(int ready, int active, int k, bool even) {
+    std::vector<int> out;
+    split_groups(ready, active, k, even, out);
     return out;
 }
 

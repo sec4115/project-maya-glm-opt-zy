@@ -196,9 +196,9 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
             if (c.hop_h != nullptr) continue;
             if (cudaHostAlloc((void**) &c.hop_h, (size_t) g.hc * g.n_embd * sizeof(float), cudaHostAllocPortable) !=
                     cudaSuccess ||
-                cudaHostAlloc((void**) &c.emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocPortable) !=
+                cudaHostAlloc((void**) &c.emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped) !=
                     cudaSuccess ||
-                cudaHostAlloc((void**) &c.tok_h, sizeof(int), cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc((void**) &c.tok_h, sizeof(int), cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
                 cudaEventCreateWithFlags(&c.ev_hop, cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventCreateWithFlags(&c.ev_done, cudaEventDisableTiming) != cudaSuccess) {
                 cudaGetLastError();
@@ -231,13 +231,19 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
         err = "glm multi: no embedding dequantizer";
         return false;
     }
+    if (F->zero_copy && c.emb_hd == nullptr &&
+        cudaHostGetDevicePointer((void**) &c.emb_hd, c.emb_h, 0) != cudaSuccess) {
+        err = "glm multi: mapped embedding alias";
+        return false;
+    }
     // this sequence's own pinned row: its previous token has completed (multi_take), so no copy still reads it
     tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd), c.emb_h,
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(c.emb_h, img, (size_t) g.n_embd * sizeof(float));
     cudaSetDevice(dev_);
-    cudaMemcpyAsync(F->emb, c.emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    if (!F->zero_copy)
+        cudaMemcpyAsync(F->emb, c.emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    gf::embed_streams(F->zero_copy ? c.emb_hd : F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
     Glm5Model* tail = this;
     const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
@@ -266,13 +272,19 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
         err = "glm multi: output head";
         return false;
     }
+    if (FT->zero_copy && ct.tok_hd == nullptr &&
+        cudaHostGetDevicePointer((void**) &ct.tok_hd, ct.tok_h, 0) != cudaSuccess) {
+        err = "glm multi: mapped token alias";
+        return false;
+    }
+    int* const target = FT->zero_copy ? ct.tok_hd : FT->tok;
     // the logits are the tail's shared scratch: the draw goes on the same stream right behind them, before the next
     // sequence's head can write them again
     if ((sp.greedy || sp.temperature <= 0.0f) && sp.penalty_last_n <= 0)   // (penalties: the sampler's greedy pick)
-        gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
+        gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, target, FT->cs);
     else
-        tail->pick_tokens(tail->sc_ + tail->sc_logits, 1, sp, nullptr, 0, FT->tok, FT->cs);
-    cudaMemcpyAsync(ct.tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
+        tail->pick_tokens(tail->sc_ + tail->sc_logits, 1, sp, nullptr, 0, target, FT->cs);
+    if (!FT->zero_copy) cudaMemcpyAsync(ct.tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(ct.ev_done, FT->cs);
     cudaSetDevice(dev_);
     const cudaError_t e = cudaGetLastError();

@@ -1332,11 +1332,8 @@ def cached_generator():
 
 
 def arch_setting(archs) -> str:
-    """CMAKE_CUDA_ARCHITECTURES for these GPUs.  CMakeLists.txt refuses an explicit arch below 75 (Strata's own
-    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those (and Pascal's
-    sm_6x, experimental) the build asks CMake for this machine's own GPUs ("native", which the guard leaves to
-    CMake), with CUDA_VISIBLE_DEVICES limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix
-    that makes this unnecessary."""
+    """CMAKE_CUDA_ARCHITECTURES for these GPUs. Volta (sm_70) uses CUDA 12.x and "native" so CMake
+    compiles for every selected, visible device. Pascal's sm_6x remains experimental."""
     return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
 
 
@@ -1380,6 +1377,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     cuda_archs = arch_setting(archs)
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
              "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
+             f"-DMAYA_BUILD_DS4={'ON' if target == 'maya-ds4' else 'OFF'}",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
              f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
     if host_compiler:
@@ -1392,8 +1390,8 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
         " (10-30 minutes the first time, a few minutes after an update) ...")
     if cuda_archs == "native":
-        say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
-        say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
+        say("  (CMake compiles for the selected GPUs visible to nvcc; Volta requires CUDA 12.x)")
+        say(f"  CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -1769,7 +1767,10 @@ def quant_of(first: Path) -> str:
         if first.name in [names[0] for names in [shard_names(mm)] + old_names(mm)]:
             return q
     m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
-    return m.group(1) if m else first.parent.name
+    if m:
+        quant = m.group(1)
+        return "Maya-XL" if quant.upper() == "UD-Q4_K_XL" else quant
+    return first.parent.name
 
 
 def sha256_ok(path: Path, want) -> bool:

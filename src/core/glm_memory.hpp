@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <utility>
 
@@ -42,6 +43,18 @@ inline bool skip_empty_on() {
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
+}
+
+// Logical CUDA device overrides win over the existing all-device setting.
+// Called while sizing pools, never in the per-token path.
+inline const char* device_memory_env(const char* name, int device, bool global = true) {
+    if (device >= 0) {
+        char key[96];
+        const int n = std::snprintf(key, sizeof key, "%s%d", name, device);
+        if (n > 0 && (size_t) n < sizeof key)
+            if (const char* value = std::getenv(key)) return value;
+    }
+    return global ? std::getenv(name) : nullptr;
 }
 
 // All inputs are bytes. On an APU the GPU pool and pinned host allocations spend

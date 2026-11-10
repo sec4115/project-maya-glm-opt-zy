@@ -43,6 +43,7 @@ class PascalSetupTests(unittest.TestCase):
 
     def test_volta_and_newer_unchanged(self):
         self.assertEqual(maya.arch_setting([70]), "native")
+        self.assertEqual(maya.arch_setting([70, 120]), "native")
         self.assertEqual(maya.arch_setting([86, 89]), "86;89")
         self.assertEqual(maya.nvcc_range([86]), ((12, 0), None))
         self.assertLess(maya.MIN_CC, maya.VALIDATED_CC)

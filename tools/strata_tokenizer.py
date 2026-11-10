@@ -15,9 +15,12 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
+import heapq
 import json
 import pathlib
 import sys
+import threading
+from collections import OrderedDict
 
 import regex
 
@@ -124,6 +127,11 @@ class _IsolatedSplits:
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+        self._cache_lock = threading.Lock()
+        self._piece_memo = {}
+        self._piece_bytes = 0
+        self._seg_cache = OrderedDict()
+        self._seg_bytes = 0
         self.tokens = tokens
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
@@ -223,26 +231,43 @@ class Tokenizer:
         segmentation and a plausible token count.
         """
         parts = list(word)
-        while len(parts) > 1:
-            best, best_rank = None, None
-            for i in range(len(parts) - 1):
-                r = self.ranks.get((parts[i], parts[i + 1]))
-                if r is not None and (best_rank is None or r < best_rank):
-                    best, best_rank = i, r
-            if best is None:
-                break
-            parts[best:best + 2] = [parts[best] + parts[best + 1]]
-        return parts
+        n = len(parts)
+        nxt, prev, version = list(range(1, n + 1)), list(range(-1, n - 1)), [0] * n
+        queue = []
+        def offer(i):
+            if i < 0 or i >= n:
+                return
+            j = nxt[i]
+            if j < n:
+                rank = self.ranks.get((parts[i], parts[j]))
+                if rank is not None:
+                    heapq.heappush(queue, (rank, i, j, version[i], version[j]))
+        for i in range(n - 1):
+            offer(i)
+        while queue:
+            _, i, j, vi, vj = heapq.heappop(queue)
+            if version[i] != vi or version[j] != vj or nxt[i] != j:
+                continue
+            parts[i] += parts[j]
+            version[i] += 1
+            version[j] += 1
+            nxt[i] = nxt[j]
+            if nxt[j] < n:
+                prev[nxt[j]] = i
+            offer(prev[i])
+            offer(i)
+        out, i = [], 0
+        while i < n:
+            out.append(parts[i])
+            i = nxt[i]
+        return out
 
     def _encode_plain(self, text: str) -> list[int]:
-        # a piece always encodes to the same ids, so they are remembered (a prompt repeats most of its words, and an
-        # agent re-sends the whole conversation every turn); the memo is dropped whole when it grows past ~300K pieces
-        memo = self.__dict__.setdefault("_piece_memo", {})
-        if len(memo) > 300_000:
-            memo.clear()
+        memo = self._piece_memo
         out: list[int] = []
         for piece in self._re.findall(text):
-            hit = memo.get(piece)
+            with self._cache_lock:
+                hit = memo.get(piece)
             if hit is not None:
                 out.extend(hit)
                 continue
@@ -262,37 +287,47 @@ class Tokenizer:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
                     got.append(i)
                 ids = tuple(got)
-            memo[piece] = ids
+            cost = self._cache_cost(piece, ids)
+            if cost <= 1024 * 1024:
+                with self._cache_lock:
+                    if piece not in memo:
+                        if self._piece_bytes + cost > 16 * 1024 * 1024:
+                            memo.clear()
+                            self._piece_bytes = 0
+                        memo[piece] = ids
+                        self._piece_bytes += cost
             out.extend(ids)
         return out
 
+    @staticmethod
+    def _cache_cost(text: str, ids: tuple) -> int:
+        # Token IDs are shared with the vocabulary. Charge the key, tuple and map overhead.
+        return sys.getsizeof(text) + sys.getsizeof(ids) + 128
+
     def _encode_segment(self, text: str) -> list[int]:
-        """_encode_plain, remembering long segments (the text between two special tokens: a message, a tool result):
-        BPE never merges across a special token, so a re-sent conversation's earlier messages encode to the same ids
-        and come from here (LRU, up to ~1M tokens)."""
         if len(text) < 2048:
             return self._encode_plain(text)
-        cache = self.__dict__.get("_seg_cache")
-        if cache is None:
-            import collections
-            import threading
-            cache = self.__dict__["_seg_cache"] = collections.OrderedDict()
-            self.__dict__["_seg_lock"] = threading.Lock()
-            self.__dict__["_seg_tokens"] = 0
-        lock = self.__dict__["_seg_lock"]
-        with lock:
+        cache = self._seg_cache
+        with self._cache_lock:
             hit = cache.get(text)
             if hit is not None:
                 cache.move_to_end(text)
-                return list(hit)
+        if hit is not None:
+            return list(hit)
         ids = self._encode_plain(text)
-        with lock:
-            if text not in cache:
-                cache[text] = tuple(ids)
-                self.__dict__["_seg_tokens"] += len(ids)
-                while self.__dict__["_seg_tokens"] > 1_000_000 and len(cache) > 1:
-                    _, old = cache.popitem(last=False)
-                    self.__dict__["_seg_tokens"] -= len(old)
+        # Avoid duplicating a large result solely to reject it from the cache.
+        if sys.getsizeof(text) + len(ids) * 8 + 168 > 4 * 1024 * 1024:
+            return ids
+        value = tuple(ids)
+        cost = self._cache_cost(text, value)
+        if cost <= 4 * 1024 * 1024:
+            with self._cache_lock:
+                if text not in cache:
+                    while self._seg_bytes + cost > 16 * 1024 * 1024:
+                        key, old = cache.popitem(last=False)
+                        self._seg_bytes -= self._cache_cost(key, old)
+                    cache[text] = value
+                    self._seg_bytes += cost
         return ids
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:

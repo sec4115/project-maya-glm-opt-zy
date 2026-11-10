@@ -23,6 +23,38 @@ from serve.server import CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, S
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class ResumeBuffer(unittest.TestCase):
+    def test_oversize_cancels_and_preserves_resume_offsets(self):
+        import threading
+        from unittest.mock import patch
+        from serve.server import StreamJob
+
+        cancel = threading.Event()
+        closed = threading.Event()
+
+        def chunks():
+            try:
+                yield {"text": "中文"}
+                yield {"text": "大" * 1024}
+                self.fail("generation continued after the buffer overflowed")
+            finally:
+                closed.set()
+
+        with patch.object(StreamJob, "MAX_BUFFER_BYTES", 1024):
+            job = StreamJob("buffer-test", chunks(), cancel)
+            with job.cv:
+                self.assertTrue(job.cv.wait_for(lambda: job.done, timeout=3))
+        self.assertTrue(cancel.is_set())
+        self.assertTrue(closed.is_set())
+        frames, done = job.wait(0, 0)
+        self.assertTrue(done)
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(json.loads(frames[0][6:]), {"text": "中文"})
+        self.assertIn(b"buffer limit exceeded", frames[1])
+        self.assertEqual(job.wait(1, 0), (frames[1:], True))
+        self.assertLessEqual(job.buffer_bytes, 1024)
+
+
 class Dashboard(unittest.TestCase):
     def setUp(self):
         os.environ["STRATA_MOCK_RELOAD_S"] = "0.3"
@@ -63,6 +95,39 @@ class Dashboard(unittest.TestCase):
                 return json.loads(b)
             time.sleep(0.05)
         self.fail("the reload did not end")
+
+    def test_modular_frontend_assets_are_served(self):
+        import re
+        web = ROOT / "serve/web"
+        status, _, page = self.req("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b'type="module"', page)
+        for asset in web.iterdir():
+            if asset.suffix not in (".js", ".css", ".svg", ".webmanifest"):
+                continue
+            with self.subTest(asset=asset.name):
+                status, headers, body = self.req("GET", "/web/" + asset.name)
+                self.assertEqual(status, 200)
+                self.assertEqual(body, asset.read_bytes())
+                if asset.suffix == ".js":
+                    self.assertIn("javascript", headers["Content-Type"])
+                    for dep in re.findall(r'from\s+["\'](\./[^"\']+)["\']', body.decode("utf-8")):
+                        self.assertTrue((web / dep).is_file(), dep)
+        for path in ("/web/../server.py", "/web/fonts/../server.py"):
+            self.assertEqual(self.req("GET", path)[0], 404)
+
+    def test_resume_replays_the_same_sse_frames(self):
+        status, _, raw = self.req("POST", "/v1/chat/completions", {
+            "model": "m", "messages": [{"role": "user", "content": "hello"}],
+            "stream": True, "strata_resume": True,
+        })
+        self.assertEqual(status, 200)
+        frames = [line for line in raw.splitlines() if line.startswith(b"data: ")]
+        self.assertEqual(frames[-1], b"data: [DONE]")
+        job_id = json.loads(frames[0][6:])["id"]
+        status, _, raw = self.req("GET", f"/v1/strata/stream?id={job_id}&from=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([line for line in raw.splitlines() if line.startswith(b"data: ")], frames[1:])
 
     def test_health_has_the_version(self):
         s, _, b = self.req("GET", "/health")

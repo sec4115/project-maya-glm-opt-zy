@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2.  The kernels need sm_80 or newer (tf32 mma, bf16 math) and the guard
-# below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
-# and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets include optimized sm_80 paths, with portable fallbacks for Volta (sm_70) and newer.
+# The guard below rejects older devices instead of silently building an unsupported binary.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.27 LANGUAGES CXX)
 
@@ -36,11 +35,19 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Restricted Windows launch environments may omit PROCESSOR_ARCHITECTURE. CMake then leaves the
+# processor empty and ggml silently builds scalar CPU dots, even when MSVC has identified an x64 target.
+# Use the compiler's target only when the system value is missing; preserve explicit/cross-build settings.
+if(MSVC AND NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+  set(CMAKE_SYSTEM_PROCESSOR "AMD64")
+  message(STATUS "Maya: inferred missing CPU architecture AMD64 from MSVC x64 target")
+endif()
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+option(MAYA_BUILD_DS4 "Build the optional DeepSeek engine (disable for local GLM-only installs)" ON)
 option(STRATA_ENABLE_HIP "Build the HIP targets for gfx1100 wave32 hardware" OFF)
 option(STRATA_PREFILL_MMQ "Build the GGML MMQ prompt path for HIP (a HIP build needs it)" OFF)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
@@ -76,15 +83,14 @@ if(STRATA_ENABLE_CUDA)
   endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
-    # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
-    # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
-    # Pre-sm_75 is refused.
+    # The GLM path also supports Volta (sm_70) with its portable FP32 scorer fallback. CUDA 13 dropped
+    # offline compilation for sm_70, so Volta builds require CUDA 12.x. Turing+ also build normally.
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 75)
+    if(_base LESS 70)
       message(FATAL_ERROR
-        "Maya needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
+        "Maya needs an NVIDIA GPU of compute capability 7.0 or newer (Volta / RTX 20 / 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
@@ -162,6 +168,9 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(prefill_cpu_test src/core/prefill_cpu_test.cpp)
+  target_include_directories(prefill_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME prefill_cpu_test COMMAND prefill_cpu_test)
   add_executable(ds4_prefill_stats_test tests/ds4_prefill_stats_test.cpp)
   add_test(NAME ds4_prefill_stats_test COMMAND ds4_prefill_stats_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
@@ -434,7 +443,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the pieces a prompt is
   # read in between decode steps (prefill_pieces): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test exl3_mma_rows_test prefix_cut_test mtp_rows_test prefill_pieces_test)
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test exl3_mma_rows_test prefix_cut_test mtp_rows_test prefill_pieces_test loop_history_test window_runtime_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)
@@ -467,7 +476,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # DeepSeek-V4.1-Flash (EXL3, tools/ds4/pack.py; or a GGUF, tools/ds4/pack_gguf.py): its own engine over the kernel
   # libraries (src/ds4)
   # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(MAYA_BUILD_DS4 AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
                               src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
@@ -858,6 +867,9 @@ endif()
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+if(TARGET strata_engine)
+  target_link_libraries(strata_engine PUBLIC strata_spec)
+endif()
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
@@ -873,6 +885,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  add_executable(glm_cache_policy_test tests/glm_cache_policy_test.cpp)
+  target_include_directories(glm_cache_policy_test PRIVATE include)
+  add_test(NAME glm_cache_policy_test COMMAND glm_cache_policy_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
@@ -1176,5 +1191,21 @@ if(STRATA_BUILD_TESTS)
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
+  endif()
+endif()
+
+if(STRATA_ENABLE_CUDA)
+  add_executable(glm_mapped_transfer_test EXCLUDE_FROM_ALL tests/glm_mapped_transfer_test.cu)
+  target_link_libraries(glm_mapped_transfer_test PRIVATE strata_engine strata_prefill)
+  add_executable(glm_cpu_schedule_test EXCLUDE_FROM_ALL tests/glm_cpu_schedule_test.cpp)
+  target_include_directories(glm_cpu_schedule_test PRIVATE ${_strata_gpu_include_directories} ${STRATA_GGML_DIR}/ggml/include)
+  target_link_libraries(glm_cpu_schedule_test PRIVATE strata_engine strata_prefill)
+  # Keep focused decode parity checks available in the production build without
+  # enabling or compiling the entire upstream test suite.
+  if(NOT STRATA_BUILD_TESTS)
+    foreach(_glm_check glm_moe_rows_test glm_rows_kernels_test glm_rows_attn_test)
+      add_executable(${_glm_check} EXCLUDE_FROM_ALL tests/${_glm_check}.cu)
+      target_link_libraries(${_glm_check} PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    endforeach()
   endif()
 endif()

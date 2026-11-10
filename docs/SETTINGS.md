@@ -161,7 +161,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_ROUTE_LOG` | off | `<prefix>`: every decode route as a line in `<prefix>.<GPU>` - the layer, its experts, which were fetched, missed or computed on the CPU, then after a `\|` the 16 near misses (the next ranks by the same score) - for cache studies: `tools/glm_tier_replay.py` replays a log through a model of the VRAM tier's rules and alternatives |
 | `MAYA_GLM_SCORE_PREFILL` | off | with `MAYA_GLM_SCORE=<c>` (score `--tokens` after the first c): `1` reads those c tokens through the prompt path instead of one by one, so a long context is scored in minutes (debug: comparing KV-cache formats at long context) |
 | `MAYA_GLM_MULTI_BENCH` | off | `<n>,<prompt>,<tokens>` (with `MAYA_GLM_SEQS` >= n, `--glm-pack`, no `--serve`): n prompts, then that many greedy tokens each - sequence 0 alone through the token path, then all n through the pipelined decode; positive `MAYA_GLM_SPLIT_ROWS` groups up to k sequences per part and reports `split-rows`; prints both rates and how many of sequence 0's tokens agree (all of them with `MAYA_GLM_CPU_LANE=0`). `MAYA_GLM_MULTI_DUMP=<file>` also writes every sequence's tokens there, a line each (then the lone run's), to compare two builds or settings token for token |
-| `MAYA_GLM_THINK_RESERVE` | 1024 | the server: a thinking block is closed early enough to leave the answer at least this many tokens, or a quarter of the request's `max_tokens` if that is more (the config's `"thinking_budget"` is lowered per request to fit) - a request whose `max_tokens` runs out while the model is still thinking otherwise ends with no answer at all |
+| `MAYA_GLM_THINK_RESERVE` | 1024 | the server: preferred token reserve for the final answer, raised to a quarter of the request's `max_tokens` when larger; the preferred floor is capped at half of a small output limit so reasoning still has room. The forced `</think>` token also counts toward the output limit. The config's `"thinking_budget"` is lowered per request to fit; the reserve can also be supplied as `STRATA_GLM_THINK_RESERVE` in the run config's `env` - a request whose `max_tokens` runs out while the model is still thinking otherwise ends with no answer at all |
 | `MAYA_ENGINE_STALL_S` | 90 | the server: an engine silent this long that also used no CPU, disk or GPU in that time is stuck - it is ended, the request gets an error and the next request starts it again (a silent engine that is working is never ended); `0` = off |
 | `MAYA_WATCHDOG_S` | 180 | the engine: a request that finishes no prompt layer and no token for this long has hung, even with a thread spinning (#40). The engine writes where it stopped to its log (on Windows also `maya-stall-<pid>.dmp`, every thread's stack: attach both to an issue) and ends; the request gets an error and the next request starts it again. `0` = off |
 | `MAYA_HTTP_BACKLOG`, `MAYA_MAX_BODY_MIB` | 256, 256 | the server: connections that may wait to be accepted, and the largest request body in MiB (a larger one gets a 413 before it is read) |
@@ -509,6 +509,22 @@ on are used (`taskset`, a container's cpuset).
 | --- | --- | --- |
 | `--cpu-threads N` (the config's engine `args`) | a thread per core | at most N threads, a thread per core; nothing is measured |
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
+
+## GLM: single-GPU MTP runtime costs
+
+When the single-GPU MTP decoder is active (`MAYA_GLM_MTP_DECODE=1`, enabled automatically on supported
+Strix/Gorgon Halo APUs), it selects draft length by expected committed tokens per millisecond.
+`MAYA_GLM_MTP_RUNTIME=1` enables an experimental cost estimator using the median of the latest nine measured
+rounds of each length. A mature median moving by more than 20% requests
+an earlier short probe of a neighbouring length, so old timings can be refreshed after workload changes.
+The existing two-round settling period after changing lengths is retained. No extra GPU synchronization is added.
+
+`MAYA_GLM_MTP_RUNTIME=0` keeps the existing EMA cost estimator and periodic probe schedule; this is the default.
+Streaming experts can produce genuine long I/O stalls, so measure representative workloads before choosing
+the median estimator. `MAYA_GLM_MTP_FIXED` and `MAYA_GLM_MTP_ADAPT=0` retain their fixed-length behavior.
+This setting does not affect the split-GPU one-draft pipeline, DFlash2, or DeepSeek's DSpark decoder.
+Changes in window size retain the existing target sampling and verification rules; exact output equivalence
+and performance across hardware still require model tests.
 
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 

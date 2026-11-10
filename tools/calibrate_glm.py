@@ -27,6 +27,7 @@ expert tiers follow the text and the OS adds noise, so single measurements diffe
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import statistics
 import sys
@@ -174,6 +175,25 @@ def reads_disk(info: dict) -> bool:
     return experts > held > 0
 
 
+def observed_disk_reads(log: str | None, since: int = 0) -> bool | None:
+    """Detect expert reads in this run, even when duplicate/spare slots inflate capacity.
+
+    Inspect at most 64 KiB and never include an earlier engine's log lines.
+    None means that no usable runtime statistics were available.
+    """
+    if not log:
+        return None
+    try:
+        with open(log, "rb") as f:
+            end = f.seek(0, 2)
+            f.seek(max(since, max(0, end - 65536)))
+            tail = f.read(65536).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    rates = re.findall(r"^glm stat:.*?\bdisk ([\d.]+) reads/tok", tail, re.MULTILINE)
+    return any(float(rate) > 0 for rate in rates) if rates else None
+
+
 class Session:
     """One running engine: decode tok/s for a setting (the median of the rates of the next GROUP prompts - each
     measurement its own, in turn through `ids_list`)."""
@@ -260,6 +280,8 @@ def measure(cfg: dict, ids_list, start_engine, say=print, extra_threads=(), kept
     """`kept`: the config's own values of KEYS (an earlier calibration's, or set by hand) - the incumbent: the sweeps'
     choice replaces them only when it beats them, all together, by more than MIN_GAIN interleaved (#277)."""
     t0 = time.time()
+    log = cfg.get("log")
+    log_start = Path(log).stat().st_size if log and Path(log).is_file() else 0
     report: dict = {}
     settings: dict = {}
     say("  Loading the model for the measurements (it reads the experts into RAM and VRAM first) ...")
@@ -308,7 +330,9 @@ def measure(cfg: dict, ids_list, start_engine, say=print, extra_threads=(), kept
         # 4. the disk reads' size, at those settings - only when part of the model is read from the SSD while it
         #    answers; a size is kept as the others are, by beating the engine's own in an interleaved re-measurement
         chunks = None
-        if reads_disk(info):
+        observed_disk = observed_disk_reads(log, log_start)
+        report["disk_reads_observed"] = observed_disk
+        if reads_disk(info) or observed_disk is True:
             at = (chosen[0], None if chosen[1] == d_threads else chosen[1])
             by_chunks = {None: [s.rate(tune_keys(*at))]}
             say(f"    the engine's own disk reads (8 pieces an expert part): {by_chunks[None][0]:.1f} tok/s")

@@ -211,7 +211,7 @@ class Responses(ResponseCase):
             {"input": [{"type": "function_call_output", "call_id": "missing", "output": "value"}]},
             {"input": [{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{}"}]},
             {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "url", "detail": "high"}]}]},
-            {"text": {"format": {"type": "json_schema"}}}, {"reasoning": {"summary": "auto"}},
+            {"text": {"format": {"type": "json_schema"}}}, {"reasoning": {"summary": "invalid"}},
             {"include": ["reasoning.encrypted_content"], "reasoning": {"effort": "low"}},
             {"max_output_tokens": 0}, {"max_output_tokens": True}, {"stream": "true"},
             {"truncation": "auto"}, {"conversation": "conv_1"}, {"input": None}, {"input": []},

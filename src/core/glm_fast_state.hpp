@@ -9,6 +9,8 @@
 #include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
+#include "strata/core/dirty_slots.hpp"
+#include "strata/core/expert_pipeline.hpp"
 #include "glm_layer_graphs.hpp"
 
 #include "ggml.h"
@@ -463,6 +465,12 @@ struct Glm5Model::FastState {
     unsigned long long* tab = nullptr;
     gf::MoeRequest* ring_h = nullptr;
     gf::MoeResponse* resp_h = nullptr;
+    // Opt-in small mapped transfers; compute-stream completion protects host reuse.
+    bool zero_copy = false;
+    float* emb_hd = nullptr;
+    int* tok_hd = nullptr;
+    int* upd_key_hd = nullptr;
+    unsigned long long* upd_val_hd = nullptr;
     float* emb_h = nullptr;     // pinned
     float* hop_h = nullptr;     // pinned, hc * n_embd
     int* tok_h = nullptr;       // pinned
@@ -606,13 +614,33 @@ struct Glm5Model::FastState {
         uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
-        std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /
+        strata::core::DirtySlots st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /
                                 // kRDemote (a D2H landing) / kRNew (a disk read this token: rtab at the boundary) /
                                 // kRLoad (a LOOKAHEAD read, maybe still in flight: rload says; rtab once it landed)
     };
     std::vector<RamClass> rc;
     std::vector<int> layer_rc;   // layer -> RAM class
     std::vector<int> ram_of;     // key -> slot in its class, -1
+    int ram_key_width = 0;
+    uint64_t boundary_round = 0, boundary_scanned = 0;
+    double boundary_wait_ms = 0, boundary_ram_ms = 0, boundary_total_ms = 0;
+    std::vector<int> boundary_work;
+    void touch_ram(int key, int slot) {
+        if (key < 0 || slot < 0 || ram_key_width <= 0) return;
+        const size_t layer = (size_t) key / (size_t) ram_key_width;
+        if (layer >= layer_rc.size()) return;
+        const int cls = layer_rc[layer];
+        if (cls >= 0 && (size_t) cls < rc.size()) rc[(size_t) cls].st.touch((size_t) slot);
+    }
+    void set_ram_of(size_t key, int slot) {
+        touch_ram((int) key, ram_of[key]);
+        ram_of[key] = slot;
+        touch_ram((int) key, slot);
+    }
+    void set_slot_of(size_t key, int slot) {
+        if (key < ram_of.size()) touch_ram((int) key, ram_of[key]);
+        slot_of[key] = slot;
+    }
     // STRATA_GLM_TIER_DIAG=1 (debug): how each expert last left the tiers (0 never held, 1 dropped from VRAM, 2 evicted
     // from RAM, 3 dropped by the prompt path's lending, 4 evicted from RAM by the lending's park), and the disk reads by
     // that cause
@@ -908,6 +936,7 @@ struct Glm5Model::KvStream {
     int row_bytes = 0;     // one position's latent row: FP16 kv_lora, or an INT8 record (lat8_rec_bytes)
     int64_t n_blocks = 0;  // pages of the context
     std::vector<uint8_t*> host;                          // per layer: the host copy (device-mapped), null: not a DSA layer
+    std::vector<uint8_t*> cpu;                           // CPU view of the same pinned rows (slot I/O, never CUDA)
     std::vector<strata::kernels::KvStreamMap> map;       // per layer
     uint8_t* host_arena = nullptr;                       // pinned: every layer's host copy
     void* map_arena = nullptr;                           // device: every layer's map

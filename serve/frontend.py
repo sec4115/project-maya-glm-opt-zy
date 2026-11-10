@@ -17,6 +17,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import os
 import copy
 import os
 import re
@@ -355,17 +356,35 @@ _TOOL_ORDERS_LOCK = threading.Lock()
 _TOOL_ORDERS_MAX = 64
 
 
+def _canonical_tool_tree(value):
+    """JSON object order is immaterial to schemas; array order and values are not.
+
+    Normalize definitions only, never message history or generated call arguments.
+    No cross-request object cache: a large client schema cannot accumulate in RAM.
+    """
+    if isinstance(value, dict):
+        return {k: _canonical_tool_tree(value[k]) for k in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_tool_tree(v) for v in value]
+    return value
+
+
 def stable_tool_order(tools: list[dict] | None) -> list[dict] | None:
     """The same set of tools comes back in the order it was first seen.  Clients send their tools in the order their
     MCP servers finished registering, which can differ from one request (or one client restart) to the next, and the
     template renders the tool list at the start of the prompt: one swap moved the shared prefix back to the system
     prompt and the whole conversation was read again.  A tool set's first request is left as sent (its prompt is what
     the client asked for); later ones with the same names in another order are put back in that first order.
-    Duplicate or missing names, or fewer than two tools: as sent."""
-    if not tools or len(tools) < 2:
+    Duplicate or missing names: as sent. Valid definitions also have canonical
+    object-key order (arrays unchanged), unless STRATA_PREFIX_CANONICAL_TOOLS=0."""
+    if not tools:
         return tools
     names = [t.get("name") if isinstance(t, dict) else None for t in tools]
     if not all(isinstance(n, str) for n in names) or len(set(names)) != len(names):
+        return tools
+    if os.environ.get("STRATA_PREFIX_CANONICAL_TOOLS", "1") != "0":
+        tools = [_canonical_tool_tree(t) for t in tools]
+    if len(tools) < 2:
         return tools
     key = frozenset(names)
     with _TOOL_ORDERS_LOCK:
@@ -378,6 +397,42 @@ def stable_tool_order(tools: list[dict] | None) -> list[dict] | None:
         _TOOL_ORDERS.move_to_end(key)
     pos = {n: k for k, n in enumerate(order)}
     return sorted(tools, key=lambda t: pos[t["name"]])
+
+
+def ordered_tool_results(messages: list[dict]) -> list[dict]:
+    """Match contiguous result blocks without pairwise call/result scans.
+
+    Some model templates have no IDs in their rendered observations. Reorder here too,
+    rather than relying on a particular template. Legacy histories without IDs still work.
+    """
+    out, order, pending, seen = [], {}, {}, set()
+
+    def flush():
+        if pending:
+            out.extend(pending[k] for k in sorted(pending, key=order.__getitem__))
+            pending.clear()
+
+    for m in messages:
+        if m.get("role") == "tool" and order and m.get("tool_call_id"):
+            cid = m["tool_call_id"]
+            if cid not in order or cid in seen:
+                raise ValueError("tool result has an unknown or duplicate tool_call_id")
+            seen.add(cid)
+            pending[cid] = m
+            continue
+        flush()
+        out.append(m)
+        if m.get("role") == "assistant":
+            ids = [c.get("id") for c in m.get("tool_calls") or []]
+            named = [cid for cid in ids if cid]
+            if any(not isinstance(cid, str) for cid in named) or len(set(named)) != len(named):
+                raise ValueError("tool call IDs must be unique strings")
+            order = {cid: i for i, cid in enumerate(named)} if len(named) == len(ids) else {}
+            seen = set()
+        elif m.get("role") != "tool":
+            order, seen = {}, set()
+    flush()
+    return out
 
 
 def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
@@ -438,6 +493,8 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         if role == "developer":
             role = "system"
         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
+        if role == "tool" and m.get("tool_call_id"):
+            out["tool_call_id"] = m["tool_call_id"]
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
@@ -447,7 +504,10 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
                 args = fn.get("arguments")
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
                     args = json.loads(args) if args.strip() else {}
-                calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
+                call = {"function": {"name": fn.get("name"), "arguments": args or {}}}
+                if c.get("id"):
+                    call["id"] = c["id"]
+                calls.append(call)
             out["tool_calls"] = calls
         if role == "assistant" and not out["content"] and not out.get("tool_calls") and not out.get("reasoning_content"):
             continue   # an empty turn is not rendered: a history of them teaches the model to answer with nothing
@@ -472,7 +532,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         kwargs["_force_tool"] = ""
     elif tools and isinstance(tc, dict) and tc.get("type") == "function" and (tc.get("function") or {}).get("name"):
         kwargs["_force_tool"] = tc["function"]["name"]
-    return _late_system_to_user(messages), tools, kwargs
+    return messages if deepseek else _late_system_to_user(ordered_tool_results(messages)), tools, kwargs
 
 
 def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
@@ -505,11 +565,20 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
                 call = {"function": {"name": block.get("name"), "arguments": block.get("input") or {}}}
+                if block.get("id"):
+                    call["id"] = block["id"]
                 if deepseek:
-                    call.update(id=block.get("id", ""), type="function")
+                    call["type"] = "function"
                 calls.append(call)
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+                value = _parts_of(block.get("content"))
+                if block.get("is_error") is True:
+                    prefix = "[Tool execution failed]\n"
+                    value = prefix + value if isinstance(value, str) else [{"type": "text", "text": prefix}, *value]
+                result = {"role": "tool", "content": value}
+                if block.get("tool_use_id"):
+                    result["tool_call_id"] = block["tool_use_id"]
+                messages.append(result)
         if text or calls or reasoning:
             out = {"role": m["role"], "content": ("\n\n" if deepseek else "").join(text)}
             if reasoning:
@@ -539,7 +608,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
         kwargs["_force_tool"] = ""
     elif tools and tc.get("type") == "tool" and tc.get("name"):
         kwargs["_force_tool"] = tc["name"]
-    return messages if deepseek else _late_system_to_user(messages), tools, kwargs
+    return messages if deepseek else _late_system_to_user(ordered_tool_results(messages)), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser

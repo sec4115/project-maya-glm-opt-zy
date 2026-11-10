@@ -152,5 +152,35 @@ class PreSchemeGuard(unittest.TestCase):
             Tokenizer(list(BYTE_TO_UNICODE.values()), [], pre=pre)
 
 
+class BpeOrdering(unittest.TestCase):
+    def test_lowest_rank_wins_before_leftmost(self):
+        t = object.__new__(Tokenizer)
+        t.ranks = {("a", "b"): 1, ("b", "c"): 0}
+        self.assertEqual(t._bpe("abc"), ["a", "bc"])
+
+    def test_equal_rank_uses_leftmost_pair(self):
+        t = object.__new__(Tokenizer)
+        t.ranks = {("a", "b"): 0, ("b", "c"): 0}
+        self.assertEqual(t._bpe("abc"), ["ab", "c"])
+
+    def test_removed_neighbor_cannot_merge_again(self):
+        t = object.__new__(Tokenizer)
+        t.ranks = {("a", "b"): 0, ("b", "c"): 1, ("c", "d"): 2, ("ab", "c"): 3}
+        self.assertEqual(t._bpe("abcd"), ["ab", "cd"])
+
+
+class CacheBudget(unittest.TestCase):
+    def test_large_segment_is_encoded_but_not_cached(self):
+        from unittest.mock import patch
+
+        tok = Tokenizer(list(BYTE_TO_UNICODE.values()), [])
+        text = "a" * (4 * 1024 * 1024)
+        with patch.object(tok, "_encode_plain", return_value=[42]) as encode:
+            self.assertEqual(tok._encode_segment(text), [42])
+            encode.assert_called_once_with(text)
+        self.assertEqual(tok._seg_bytes, 0)
+        self.assertNotIn(text, tok._seg_cache)
+
+
 if __name__ == "__main__":
     unittest.main()

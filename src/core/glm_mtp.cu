@@ -28,6 +28,8 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/draft_policy.hpp"
 
 #include "ggml.h"
 
@@ -71,6 +73,19 @@ bool mtp_chain_wanted() {
         return e == nullptr || std::atoi(e) != 0;
     }();
     return v;
+}
+
+// Opt-in until model/hardware-specific A/B runs establish the benefit. In a
+// streaming-expert setup, long wall times may be real I/O work, not host noise.
+// Keep the existing EMA / probe policy as the default.
+// The recent-cost policy only changes how many drafts are verified; target
+// sampling, acceptance, recurrent-state commit and cache writes are unchanged.
+bool mtp_runtime_wanted() {
+    static const bool enabled = [] {
+        const char* e = getenv("STRATA_GLM_MTP_RUNTIME");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return enabled;
 }
 }  // namespace
 
@@ -451,7 +466,8 @@ bool Glm5Model::mtp_fill_prev(int32_t token, int64_t p, std::string& err) {
 
 // ---------------------------------------------------------------- the draft length
 // The length that gives the most tokens per second on this machine: each length's round time (measured wall time: the
-// mean of its first rounds, then an EMA) against the tokens a round of it yields - 1 + a1 + a1 a2 + ..., a_i the share
+// recent median, or the legacy EMA with STRATA_GLM_MTP_RUNTIME=0) against the tokens a round of it yields -
+// 1 + a1 + a1 a2 + ..., a_i the share
 // of rounds that reached draft i (all before it accepted) and accepted it.  STRATA_GLM_MTP_ADAPT=0: always n_cap.
 //
 // The search starts at STRATA_GLM_MTP_START (2) and climbs: the start runs a stint of measured rounds, then each
@@ -510,7 +526,8 @@ int Glm5Model::mtp_choose(int n_cap) {
             run *= a[i];
             e += run;
         }
-        const double rate = e / std::max(1e-3, mtp_ms_[n]);
+        const double ms = mtp_runtime_wanted() ? mtp_runtime_.cost_ms(n) : mtp_ms_[n];
+        const double rate = e / std::max(1e-3, ms);
         if (rate > best) {
             best = rate;
             bn = n;
@@ -730,10 +747,18 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             mtp_prev_n_ = nd;
             mtp_same_ = 0;
         }
-        if (mtp_same_ >= 2 && nd < 9) {
+        if (mtp_same_ >= 2 && nd < 9 && std::isfinite(ms) && ms > 0.0) {
             // (the mean of the first ten, then an EMA: one slow first round does not stand for the length)
             mtp_ms_[nd] += (ms - mtp_ms_[nd]) / (double) std::min<uint64_t>(mtp_seen_[nd] + 1, 10);
             ++mtp_seen_[nd];
+            if (mtp_runtime_wanted() && mtp_runtime_.observe(nd, ms)) {
+                // Retime the best length's neighbours after a sustained cost
+                // shift (context / expert-tier workload), without an extra GPU
+                // fence or a fresh sweep of every length. The next choose()
+                // honours any active stint, then takes its usual short probe.
+                mtp_gap_ = 32;
+                mtp_next_probe_ = mtp_round_no_;
+            }
         }
         if (trace)
             std::fprintf(stderr, "glm mtp: p0 %lld drafts %d kept %d accepted %d (%.1f ms)\n", (long long) p0, nd, keep,
@@ -763,6 +788,146 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
         ok = false;
     }
     return ok;
+}
+
+int Glm5Model::lookup_draft_cap() {
+    const char* value = getenv("STRATA_GLM_LOOKUP");
+    return value == nullptr ? 0 : std::clamp(std::atoi(value), 0, 7);
+}
+
+bool Glm5Model::decode_lookup(strata::kernels::SamplerParams& sp, const std::vector<int32_t>& prompt,
+                             int64_t max_new, const std::function<bool(int)>& emit,
+                             int64_t& produced, std::string& err) {
+    produced = 0;
+    const int cap = lookup_draft_cap();
+    if (cap <= 0 || fast_ == nullptr || max_new <= 0) {
+        err = "glm lookup: requires the fast path, a positive token limit and MAYA_GLM_LOOKUP=1..7";
+        return false;
+    }
+    strata::spec::SuffixDrafter lookup(6, 32, (size_t) max_ctx_);
+    strata::spec::DraftPolicy policy(cap + 1);
+    lookup.append(prompt.data(), prompt.size());
+    std::vector<int32_t> tokens((size_t) cap + 1), picks((size_t) cap + 1);
+    uint64_t rounds = 0, drafts = 0, hits = 0;
+    const int check_limit = getenv("STRATA_GLM_LOOKUP_CHECK") ?
+        std::clamp(std::atoi(getenv("STRATA_GLM_LOOKUP_CHECK")), 0, 32) : 0;
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    const auto copy_logits = [&](std::vector<float>& dst, const float* source, int rows = 1) {
+        dst.resize((size_t) rows * g_.n_vocab);
+        cudaSetDevice(tail->dev_);
+        const cudaError_t e = cudaMemcpy(dst.data(), source, dst.size()*sizeof(float), cudaMemcpyDeviceToHost);
+        cudaSetDevice(dev_);
+        return glmfast::cuda_ok(e, "glm lookup check logits", err);
+    };
+    const auto compare_logits = [&](const float* actual, const float* reference, const char* phase, int row) {
+        const size_t V = (size_t) g_.n_vocab;
+        const size_t ai = (size_t) (std::max_element(actual, actual+V)-actual);
+        const size_t ri = (size_t) (std::max_element(reference, reference+V)-reference);
+        double sa=0, sr=0, max_diff=0;
+        for (size_t i=0;i<V;++i) {
+            if (!std::isfinite(actual[i]) || !std::isfinite(reference[i])) { err="glm lookup check: nonfinite logits";return false; }
+            sa+=std::exp((double)actual[i]-actual[ai]);
+            sr+=std::exp((double)reference[i]-reference[ri]);
+            max_diff=std::max(max_diff,std::abs((double)actual[i]-reference[i]));
+        }
+        const double za=std::log(sa)+actual[ai], zr=std::log(sr)+reference[ri];
+        double kl=0;
+        for (size_t i=0;i<V;++i) kl+=std::exp((double)reference[i]-zr)*((double)reference[i]-zr-actual[i]+za);
+        std::fprintf(stderr,"glm lookup check: %s row %d KL %.9g max_diff %.9g top1 %s\n",
+                     phase,row,kl,max_diff,ai==ri?"same":"DIFFERENT");
+        if (!std::isfinite(kl) || kl>1e-4 || ai!=ri) { err="glm lookup: numerical window/rollback check failed";return false; }
+        return true;
+    };
+    struct Report {
+        uint64_t& rounds; uint64_t& drafts; uint64_t& hits;
+        ~Report() { std::fprintf(stderr, "glm lookup: %llu windows, %llu drafts, %llu accepted\n",
+            (unsigned long long) rounds, (unsigned long long) drafts, (unsigned long long) hits); }
+    } report{rounds, drafts, hits};
+    const auto send = [&](int token) {
+        sp.counter += 1;
+        last_tok_ = token;
+        ++produced;
+        lookup.append(token);
+        return emit(token) && produced < max_new;
+    };
+    int y = sample_token(sp, err);
+    if (y < 0) return false;
+    y = forced(y);
+    if (!send(y)) return true;
+    while (produced < max_new && pos_ + 1 < max_ctx_) {
+        const auto began = std::chrono::steady_clock::now();
+        // Always leave room for the bonus token, so the last emitted token stays unconsumed.
+        const int room = (int) std::min<int64_t>(cap, std::min(max_new - produced - 1, max_ctx_ - pos_ - 1));
+        int nd = room > 0 ? lookup.propose(room, tokens.data() + 1) : 0;
+        const int match = lookup.last_match();
+        const auto choice = policy.choose(1, nd, match);
+        nd = choice.lookup ? std::min(nd, choice.t - 1) : 0;
+        if (nd == 0) {
+            // The ordinary path is also the fallback when measured lookup throughput loses.
+            if (!fast_token(y, err)) return false;
+            const int picked = sample_token(sp, err);
+            if (picked < 0) return false;
+            y = forced(picked);
+            policy.observe(false, 1, 0, match,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-began).count());
+            if (!send(y)) return true;
+            continue;
+        }
+        tokens[0] = y;
+        const int T = nd + 1;
+        const bool check = rounds < (uint64_t) check_limit;
+        // Diagnostic-only checkpoints 13..15 belong to this isolated check, not the conversation's snapshot.
+        if (check && !ckpt_save(15, err)) return false;
+        if (!window_pipe(tokens.data(), T, picks.data(), err, &sp)) return false;
+        std::vector<float> verified_logits;
+        if (check && !copy_logits(verified_logits,
+                tail->fast_->win.logits+(size_t) tail->fast_->win.bank*kPipeMax*g_.n_vocab,T)) return false;
+        int accepted = 0;
+        while (accepted < nd) {
+            const int followed = follow_peek((size_t) accepted);
+            const int actual = followed >= 0 ? followed : picks[(size_t) accepted];
+            if (actual != tokens[(size_t) accepted + 1]) break;
+            ++accepted;
+        }
+        ++rounds; drafts += (uint64_t) nd;
+        spec_steps_ += (uint64_t) nd;
+        bool more = true;
+        int emitted = 0;
+        for (; emitted < accepted;) {
+            const int next = forced(picks[(size_t) emitted]);
+            ++emitted;
+            more = send(next);
+            if (!more || force_tok_ >= 0) break;
+        }
+        hits += (uint64_t) emitted; spec_hits_ += (uint64_t) emitted;
+        const int keep = 1 + emitted;
+        if (!window_commit(keep, err, true)) return false;
+        if (check) {
+            if (!ckpt_save(13, err) || !ckpt_restore(15, err)) return false;
+            std::vector<float> reference;
+            for (int row=0;row<T;++row) {
+                if (!fast_token(tokens[(size_t) row],err) ||
+                    !copy_logits(reference,tail->sc_+tail->sc_logits) ||
+                    !compare_logits(verified_logits.data()+(size_t) row*g_.n_vocab,reference.data(),"window",row)) return false;
+                if (row+1==keep && !ckpt_save(14,err)) return false;
+            }
+            // Compare the next forward too: equality inside a window alone cannot prove rejection restored KDA state.
+            const int probe = picks[(size_t) keep-1];
+            if (!ckpt_restore(14,err) || !fast_token(probe,err) ||
+                !copy_logits(reference,tail->sc_+tail->sc_logits) || !ckpt_restore(13,err) || !fast_token(probe,err)) return false;
+            std::vector<float> actual;
+            if (!copy_logits(actual,tail->sc_+tail->sc_logits) ||
+                !compare_logits(actual.data(),reference.data(),"after commit",keep) || !ckpt_restore(13,err)) return false;
+        }
+        policy.observe(true, T, emitted, match,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-began).count());
+        if (!more) return true;
+        y = forced(picks[(size_t) keep - 1]);
+        if (!send(y)) return true;
+    }
+    if (gf::launch_errors() > 0) { err = "glm lookup: a kernel launch failed"; return false; }
+    return true;
 }
 
 }  // namespace strata::core

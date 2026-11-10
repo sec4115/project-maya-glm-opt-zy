@@ -1,4 +1,4 @@
-# Generated, not source: deterministic build products of tools/ (see docs/).
+﻿# Generated, not source: deterministic build products of tools/ (see docs/).
 # tiny-qwen4exp.gguf is ~113 MB, over GitHub's 100 MB file limit -- regenerate with
 #   python tools/make_tiny_model.py
 bench/tiny-*.gguf
@@ -53,3 +53,18 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# --- local additions (this machine): batch results, local state, stray binaries ---
+/bench/results/
+/data/
+/.claude/
+/.upstream-sync/
+*.bak
+build_defer2.*
+git_setup.ps1
+*.bin
+*.gguf
+*.exe
+*.dll
+*.safetensors
+*.engine

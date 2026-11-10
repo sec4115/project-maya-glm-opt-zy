@@ -53,6 +53,8 @@
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/glm_cache_policy.hpp"
+#include "strata/program/loop_history.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1595,6 +1597,7 @@ static int glm_pack_generate(const Options& o) {
                              ? std::max(0, std::min(16, (int) env_num("STRATA_GLM_CKPTS", 4)))
                              : 0;
     const int64_t ckpt_every = std::max<int64_t>(0, (int64_t) env_num("STRATA_GLM_CKPT_EVERY", 16384));
+    const bool ckpt_pin_root = env_num("STRATA_GLM_CKPT_PIN_ROOT", 1) != 0;
     // a prompt writes the state from position `from` on: the checkpoints past it no longer hold this conversation
     const auto ckpt_drop_past = [&](size_t from) {
         for (auto& c : ckpts)
@@ -1625,7 +1628,7 @@ static int glm_pack_generate(const Options& o) {
         std::sort(at.begin(), at.end());
         at.erase(std::unique(at.begin(), at.end()), at.end());
         // at most ckpt_max a prompt, the latest kept (the turn's start, then the ones before it)
-        if ((int) at.size() > ckpt_max) at.erase(at.begin(), at.end() - ckpt_max);
+        strata::program::glm_cache_policy::retain_marks(at, (size_t) ckpt_max, first, ckpt_pin_root);
         // every prompt-path call between them must reach its minimum (STRATA_GLM_PREFILL_MIN, 32: fewer go through the
         // token path, one token at a time): only the piece after the last one may be shorter
         std::vector<size_t> kept;
@@ -1653,11 +1656,14 @@ static int glm_pack_generate(const Options& o) {
     // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
     const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
-        size_t c = 0;
+        std::array<size_t, 16> lengths{};
+        std::array<uint64_t, 16> stamps{};
         for (size_t i = 0; i < ckpts.size(); ++i) {
-            if (ckpts[i].tokens.empty()) { c = i; break; }
-            if (ckpts[i].used < ckpts[c].used) c = i;
+            lengths[i] = ckpts[i].tokens.size();
+            stamps[i] = ckpts[i].used;
         }
+        const size_t c = strata::program::glm_cache_policy::victim(lengths.data(), stamps.data(), ckpts.size(),
+                                                                 ckpt_pin_root);
         std::string e;
         ckpts[c].tokens.clear();
         if (!(from_snapshot ? model.ckpt_save_snapshot((int) c, e) : model.ckpt_save((int) c, e))) {
@@ -1748,23 +1754,6 @@ static int glm_pack_generate(const Options& o) {
                 ckpts[(size_t) ck].tokens.clear();
             }
         }
-        // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
-        // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
-        // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
-        // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
-        // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.
-        if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
-            cur_img_pos.empty()) {
-            static const bool turn_on = [] { const char* v = getenv("STRATA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
-            constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
-            size_t last = 0;
-            for (size_t i = prompt.size() - 1; i-- > reuse;)
-                if (prompt[i] == kUserTok || prompt[i] == kObsTok) { last = i; break; }
-            bool have = false;
-            for (const auto& c : ckpts)
-                have = have || (c.tokens.size() == reuse && std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
-            if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
-        }
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
@@ -1781,6 +1770,23 @@ static int glm_pack_generate(const Options& o) {
         }
         if (reuse == 0) model.reset();
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
+        // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
+        // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
+        // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
+        // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
+        // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.  Keep this AFTER slot restore and checkpoint pruning (#400).
+        if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
+            cur_img_pos.empty()) {
+            static const bool turn_on = [] { const char* v = getenv("STRATA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
+            constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
+            size_t last = 0;
+            for (size_t i = prompt.size() - 1; i-- > reuse;)
+                if (prompt[i] == kUserTok || prompt[i] == kObsTok) { last = i; break; }
+            bool have = false;
+            for (const auto& c : ckpts)
+                have = have || (c.tokens.size() == reuse && std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
+            if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
+        }
         std::vector<float> lg;
         t0 = std::chrono::steady_clock::now();
         gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
@@ -2045,19 +2051,12 @@ static int glm_pack_generate(const Options& o) {
         // for legitimately repetitive output (a zero-filled array); 0 turns that check off.
         static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
         static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
-        std::vector<int> gen_hist;
+        strata::program::LoopHistory gen_hist;
         std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
         int guard_fired = 0;     // soft landings in this answer: a second loop ends it
         const auto looping = [&](int w) -> int {   // the pattern's period, 0 when the tail is not one
-            const int n = (int) gen_hist.size();
-            if (w <= 0 || n < w) return 0;
-            for (int per = 1; per <= 32 && per < w / 4; ++per) {
-                bool rep = true;
-                for (int i = n - w + per; i < n && rep; ++i) rep = gen_hist[(size_t) i] == gen_hist[(size_t) (i - per)];
-                if (rep) return per;
-            }
-            return 0;
+            return gen_hist.looping(w);
         };
         const auto on_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
@@ -2140,7 +2139,14 @@ static int glm_pack_generate(const Options& o) {
             return produced < max_new;
         };
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
+        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.lookup_draft_cap() > 0 && req_spec != 1) {
+            int64_t n_lookup = 0;
+            if (!model.decode_lookup(sp, prompt, max_new, on_token, n_lookup, err)) {
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
             // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
             // below for the same samples); --spec T caps a round's window at T tokens
             int64_t n_spec = 0;
@@ -2340,7 +2346,7 @@ static int glm_pack_generate(const Options& o) {
         bool in_think = false;
         int64_t think_budget = 0;
         int32_t think_end = -1;
-        std::vector<int> hist;   // the loop guard's window
+        strata::program::LoopHistory hist;
         bool in_arg = false;
         int guard = 0;
         int32_t force = -1;      // the next token instead of the sampled one (the thinking budget, the loop guard)
@@ -2360,6 +2366,7 @@ static int glm_pack_generate(const Options& o) {
         uint64_t mtp_steps = 0, mtp_drafts = 0, mtp_acc = 0;
     };
     std::vector<std::unique_ptr<Gen>> gens;
+    gens.reserve((size_t) model.seq_count());
     std::deque<Gen*> flight;     // issued, oldest first
     std::deque<int> flight_groups;   // split rows: the sizes of the issued groups, oldest first
     // a request no idle context can hold yet (its prompt needs the large first context, which is busy): it waits
@@ -2385,17 +2392,22 @@ static int glm_pack_generate(const Options& o) {
     // STRATA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
     // k at a time (strata/core/split_groups.hpp): k 4 no longer makes one group - and idle GPUs - at 4 requests or fewer
     static const bool even_groups = env_num("STRATA_GLM_EVEN_GROUPS", 0) != 0;
-    // Reuse split-row scheduler buffers; allocating vectors for each decode group defeats part of the batching gain.
+    // Reuse single-GPU and split-row scheduler buffers, plus the speculative fallback's logits.
+    // Their capacities survive each step; no per-token vector allocation after warm-up.
     std::vector<Gen*> split_group;
     std::vector<int> split_seqs;
     std::vector<int32_t> split_toks;
     std::vector<strata::kernels::SamplerParams> split_sps;
-    if (split_rows > 0) {
-        const size_t cap = (size_t) split_rows;
+    std::vector<int> row_outputs, group_sizes;
+    std::vector<float> multi_logits;
+    group_sizes.reserve((size_t) model.seq_count());
+    if (split_rows > 0 || model.rows_ok()) {
+        const size_t cap = (size_t) (model.rows_ok() ? strata::core::Glm5Model::rows_max() : split_rows);
         split_group.reserve(cap);
         split_seqs.reserve(cap);
         split_toks.reserve(cap);
         split_sps.reserve(cap);
+        row_outputs.reserve(cap);
     }
     int since_boundary = 0;
     uint64_t multi_n = 0;        // tokens since the engine last had nothing to do (the STAT lines' rate)
@@ -2424,14 +2436,7 @@ static int glm_pack_generate(const Options& o) {
         strata::core::progress_beat();
         g.hist.push_back(tok);
         const auto looping = [&](int w) -> int {
-            const int n = (int) g.hist.size();
-            if (w <= 0 || n < w) return 0;
-            for (int per = 1; per <= 32 && per < w / 4; ++per) {
-                bool rep = true;
-                for (int i = n - w + per; i < n && rep; ++i) rep = g.hist[(size_t) i] == g.hist[(size_t) (i - per)];
-                if (rep) return per;
-            }
-            return 0;
+            return g.hist.looping(w);
         };
         static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
         static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
@@ -2982,7 +2987,6 @@ static int glm_pack_generate(const Options& o) {
     // pipelined decode (and every request with a token to feed issued first).  Errors end the running requests.
     bool step_no_spec = false;   // (between a prompt's pieces: the speculative stint runs until input comes - not there)
     const auto multi_step = [&] {
-        std::vector<float> lg;
         // (a PAUSE in the last read's gaps: its snapshot, once no request waits for its first token)
         if (!deferred_pauses.empty() && !in_read_gap && admitting_rid.load() < 0 &&
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
@@ -2992,7 +2996,7 @@ static int glm_pack_generate(const Options& o) {
             Gen& g = *only;
             bind_ctx(g.ctx);
             if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
-                if (!model.forward({g.pending}, lg, err)) {
+                if (!model.forward({g.pending}, multi_logits, err)) {
                     multi_fail(err);
                     return;
                 }
@@ -3114,28 +3118,29 @@ static int glm_pack_generate(const Options& o) {
         }
         // ONE GPU: every request with a token to feed goes through one step together, each weight read once for all
         if (model.rows_ok()) {
-            std::vector<Gen*> rg;
-            std::vector<int> seqs, out;
-            std::vector<int32_t> toks;
-            std::vector<strata::kernels::SamplerParams> sps;
+            split_group.clear();
+            split_seqs.clear();
+            split_toks.clear();
+            split_sps.clear();
             for (auto& gp : gens)
-                if (!gp->done && gp->pending >= 0 && (int) rg.size() < strata::core::Glm5Model::rows_max()) {
-                    rg.push_back(gp.get());
-                    seqs.push_back(gp->ctx);
-                    toks.push_back(gp->pending);
-                    sps.push_back(gp->sp);
+                if (!gp->done && gp->pending >= 0 && (int) split_group.size() < strata::core::Glm5Model::rows_max()) {
+                    split_group.push_back(gp.get());
+                    split_seqs.push_back(gp->ctx);
+                    split_toks.push_back(gp->pending);
+                    split_sps.push_back(gp->sp);
                 }
-            if (!rg.empty()) {
-                out.resize(rg.size());
-                if (!model.multi_rows(seqs.data(), toks.data(), sps.data(), (int) rg.size(), out.data(), err)) {
+            if (!split_group.empty()) {
+                row_outputs.resize(split_group.size());
+                if (!model.multi_rows(split_seqs.data(), split_toks.data(), split_sps.data(),
+                                      (int) split_group.size(), row_outputs.data(), err)) {
                     multi_fail(err);
                     return;
                 }
-                for (size_t i = 0; i < rg.size(); ++i) {   // (the step keeps the tiers' boundary itself)
-                    Gen& g = *rg[i];
+                for (size_t i = 0; i < split_group.size(); ++i) {   // (the step keeps the tiers' boundary itself)
+                    Gen& g = *split_group[i];
                     g.sp.counter += 1;
                     g.pending = -1;
-                    gen_took(g, out[i]);
+                    gen_took(g, row_outputs[i]);
                 }
             }
             gen_sweep();
@@ -3172,12 +3177,12 @@ static int glm_pack_generate(const Options& o) {
                 ready += !gp->inflight && gp->pending >= 0;
                 active += gp->inflight || gp->pending >= 0;
             }
-            const std::vector<int> sizes = strata::core::split_groups(ready, active, split_rows, even_groups);
+            strata::core::split_groups(ready, active, split_rows, even_groups, group_sizes);
             size_t gi = 0;
             for (auto& gp : gens) {
                 if (gp->done || gp->inflight || gp->pending < 0) continue;
                 split_group.push_back(gp.get());
-                if (gi < sizes.size() && (int) split_group.size() == sizes[gi]) {
+                if (gi < group_sizes.size() && (int) split_group.size() == group_sizes[gi]) {
                     ++gi;
                     if (!issue()) { multi_fail(err); return; }
                 }
@@ -4025,7 +4030,7 @@ static int glm_pack_generate(const Options& o) {
             int64_t max_new = 0;
             ss >> max_new;
             strata::kernels::SamplerParams rq = sp;
-            bool any_key = false, greedy_req = false;
+            bool any_key = false, greedy_req = false, seed_req = false;
             req_think_budget = 0;
             req_think_end = -1;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
@@ -4059,7 +4064,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "top_p") { rq.top_p = (float) std::atof(v.c_str()); any_key = true; }
                 else if (k == "top_k") { rq.top_k = std::atoi(v.c_str()); any_key = true; }
                 else if (k == "min_p") { rq.min_p = (float) std::atof(v.c_str()); any_key = true; }
-                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
+                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); seed_req = rq.seed != 0; }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
@@ -4099,6 +4104,10 @@ static int glm_pack_generate(const Options& o) {
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            // a sampled request without a seed draws a new one (#845: seed 0 for every such request gave the same
+            // answer each time); a seed in the request, or --seed when the engine started, stays exact
+            if (!rq.greedy && !seed_req && o.seed == 0)
+                rq.seed = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
             // a repeat penalty of 0 or below (some clients' "off"; the logits would be divided by it) or a value that is
             // not a number counts as neutral
             if (!std::isfinite(pen_repeat) || pen_repeat <= 0.0f) pen_repeat = 1.0f;
