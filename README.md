@@ -1,319 +1,178 @@
-<h1 align="center">Project Maya</h1>
+# maya-glm-opt — a tuned Project Maya fork · GLM-5.3-Flash 本地优化 fork
 
-<p align="center"><b>GLM-5.3-Flash (321 B) and DeepSeek-V4.1-Flash-1017 (748 B) on your own GPU</b><br>
-private and fast · one NVIDIA GPU or up to 16 · AMD and Windows (experimental) · chat, pictures, OpenAI- and
-Anthropic-compatible API · several requests at once</p>
+**English** — This repository is a source-only mirror of **Project Maya** (engine base `v1.1.26`) carrying a
+local performance-optimization layer aimed at running **GLM-5.3-Flash** well on a specific 3-GPU hybrid
+workstation. It is a personal fork: the upstream engine source is kept intact as a pristine ancestor commit,
+and all local work is consolidated into a single "local layer" commit on top — so future upstream releases
+can be absorbed with a clean 3-way merge.
 
-<p align="center">
-<a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FGLM-5.3-Flash-Maya-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=GLM-5.3-Flash%20Maya%20downloads" alt="GLM-5.3-Flash Maya downloads"></a>
-<a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FGLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=Maya-M-Derisked%20downloads" alt="Maya-M-Derisked downloads"></a>
-<a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FDeepSeek-V4.1-Flash-1017-Maya-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=DeepSeek-V4.1-Flash%20Maya%20downloads" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
-</p>
+**中文** — 本仓库是 **Project Maya**（引擎基座 `v1.1.26`）的 source-only 镜像，带有一层让
+**GLM-5.3-Flash** 在三卡混合工作站上跑得更好的本地性能优化。它是个人使用的 fork：
+上游引擎源码以“纯净祖先提交”原样保留，所有本地改动收敛为顶上的单个“本地层”提交——
+将来同步上游新版本时可以做干净的三路合并。
 
-<p align="center">Created and led by <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), co-maintained
-with <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
+Upstream: **Project Maya** by Peasant Smith ([@mw00](https://github.com/mw00)); model quants at
+[peasantsmith on Hugging Face](https://huggingface.co/peasantsmith). The engine runs
+[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (zai-org, MIT) and DeepSeek-V4.1-Flash
+(DeepSeek, MIT) on workstation hardware with an expert-tiered memory design.
+上游项目为 Peasant Smith 的 Project Maya，模型量化发布在其 Hugging Face 主页。引擎以
+“专家分层驻留”的设计把 GLM-5.3-Flash 与 DeepSeek-V4.1-Flash 跑在工作站硬件上。
 
-<p align="center"><a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Project Maya is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+---
 
-Models this size usually need a datacenter. Maya runs **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**
-(zai-org, MIT license; 321 B parameters, about 18 B active per token, a context of up to 1 M tokens) and
-**[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** (DeepSeek, MIT license;
-748 B parameters) on the hardware you already have. Each model has an engine built for it. It keeps the experts your
-conversation uses most on the GPU, the next ones in RAM and the rest on your NVMe SSD, and moves them as you chat. It
-measures your GPUs, CPU, RAM and SSD and tunes itself to them. Nothing leaves your machine.
+## What this repository is / 本仓库是什么
 
-- **Fast:** up to 124 tokens/s on two H100s, 118 on four RTX 4090s, 81 on one RTX PRO 6000, 30+ on a single RTX 5090. Real numbers from
-  real users below.
-- **Close to the original:** Maya's own quants of GLM-5.3-Flash keep 97.7-99.2% of the FP8 model's zero-shot
-  accuracy; Maya-S of DeepSeek-V4.1-Flash-1017 picks the same next token as the original 92.6% of the time.
-- **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
-- **Several requests at once:** up to 8 answered together - for agents that run several sessions, or several people
-  on one PC.
-- **Everything in the box:** a chat and a live monitor in the browser, pictures, thinking levels, a one-command setup.
+- **Two-commit history by design / 两段式提交设计**:
+  1. `upstream v1.1.26 pristine` — the exact upstream `v1.1.26` tree (minus binary test fixtures),
+     serving as the merge ancestor / 上游 v1.1.26 归档树（去掉二进制 fixture），作为合并祖先；
+  2. `local layer` — every local change: the engine optimization layer, backports, tests, tooling and
+     docs / 全部本地改动：引擎优化层、回移补丁、测试、工具与文档。
+- **What is deliberately NOT here / 刻意不入库的内容**: model weights (GGUF), runtime configs
+  (`maya-*.json`), logs, benchmark result sets, `data/` fixtures, build outputs. They are machine-local
+  and regenerable; upstream's own `.gitignore` conventions are kept.
+  模型权重、运行配置、日志、批测产物、`data/` fixture、构建产物都不入库——它们是机器本地的、
+  可再生的；沿用上游自己的 .gitignore 约定。
+- **Not the upstream project / 这不是上游项目**: upstream's README, benchmarks and release
+  announcements live in the upstream repository; this fork documents only its own delta.
+  上游的 README、基准与发布公告在上游仓库里；本仓库只记录自己的增量。
 
-## The models
+## The engine in one paragraph / 引擎一页话
 
-Project Maya's own quants of GLM-5.3-Flash, made from Z.ai's FP8 release with statistics from the FP8 model. Each keeps
-the model's MTP block, which drafts tokens ahead.
+Maya is a Mixture-of-Experts inference engine built model-first: the experts a conversation uses most stay
+in VRAM, the next tier lives in pinned RAM, the rest is read in place from NVMe — and everything moves as
+you chat. Layers split across one or many GPUs; an MTP block drafts tokens ahead; a serve layer speaks the
+OpenAI- and Anthropic-compatible API (with tool calls) and ships a browser chat + live monitor. The decode
+path also off-loads cold experts to a CPU lane that computes them on the host.
+Maya 是一个“模型优先”的 MoE 推理引擎：对话最常用的专家常驻显存，次一级驻留内存，其余直接从
+NVMe 原位读取，并随对话流动换入换出。层可拆到单卡或多卡；MTP 模块负责超前起草；serve 层提供
+OpenAI/Anthropic 兼容 API（含工具调用）与浏览器聊天页 + 实时监视器。decode 路径还会把冷专家
+交给 CPU lane 在主机侧计算。
 
-| Model | Size | Made for | Against the FP8 model |
-| --- | ---: | --- | --- |
-| **Maya-S** (default) | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
-| **Maya-S24** | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
-| **Maya-M** | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
-| **Maya-M-Derisked** | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
-| **Maya-L** | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
+This fork builds the engine for **Volta (sm_70) through Blackwell (sm_120)** — Volta support is re-enabled
+locally (upstream dropped it from the default path).
+本 fork 把引擎编译目标覆盖 **Volta (sm_70) 到 Blackwell (sm_120)**——其中 Volta 支持是本地重新
+放行的（上游默认路径已移除）。
 
-The setup asks which one to download and recommends one for your PC. How they're made and measured: [MAYA-S](bench/results/MAYA-S.md),
-[MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md). On
-[Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
+## The local optimization layer / 本地优化层
 
-### DeepSeek-V4.1-Flash-1017 (new)
+Grouped by concern; the interesting entry points are `include/strata/core/*.hpp` and
+`src/core/glm_fast_path.cu` / 按关注点分组；入口主要在 `include/strata/core/*.hpp` 与
+`src/core/glm_fast_path.cu`:
 
-The setup also offers **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**
-(DeepSeek, MIT license; 748 B parameters) on an engine of its own (`maya-ds4`): `./setup.sh --setup` and pick it, or
-`./setup.sh --model DeepSeek-V4.1-Flash-1017`.
+- **Expert placement & caching / 专家放置与缓存**: LFRU eviction policies for the VRAM and RAM tiers,
+  per-GPU device-memory pool caps (per-device `POOL_GB` budgeting), zero-copy small transfers, and
+  dirty-slot tracking for speculative windows / VRAM 与 RAM 层的 LFRU 淘汰、按卡的显存池上限
+  （逐卡 `POOL_GB` 预算）、小传输零拷贝、投机窗口的脏槽位跟踪。
+- **CPU lane / CPU 通道**: explicit lane planning (`cpu_lane_plan.hpp`), joint calibration of lane width
+  and batch shape, a CPU expert pipeline with bitwise parity checks against the GPU reference, and a
+  CPU prefill helper / 通道宽度与批形状的联合校准、带逐位对拍校验的 CPU 专家流水线、CPU 预填充辅助。
+- **Policy & runtime objects / 策略与运行时**: cache policy, loop history, window runtime
+  (`glm_cache_policy.hpp`, `loop_history.hpp`, `window_runtime.hpp`) — each with its own test
+  / 各自附带单元测试。
+- **Upstream backports / 上游回移**: `STRATA_GLM_DEFER_CPU=2` — CPU-lane expert deferral on **every**
+  part of a multi-GPU split (upstream #722's mode 2; **LOSSY**: it changes sampled answers — drift was
+  measured and bounded before adoption; ≈ **+4.6% average decode** on the target rig across five
+  context lengths), and the #845 seed fix (a sampled request without a seed now draws a fresh seed per
+  request instead of always reusing seed 0) / 多卡分片的每一段都做 CPU 专家延迟提交（上游 #722 的
+  模式 2；**有损**——会改变采样答案，采纳前实测了漂移幅度与边界），以及 #845 种子修复。
+- **serve layer / 服务层**: a locally hardened web UI (chat, multi-chat, monitor, settings), API
+  compatibility tests (`serve/test_api_compat.py`), prefix-cache tests and response tooling
+  / 本地强化的网页界面与 API 兼容性测试、前缀缓存测试、响应处理工具。
+- **Tooling / 工具**: KV-cache benchmarking and planning (`tools/benchmark_kv_cache.py`,
+  `run_kv_plan.py`, `summarize_kv_cache.py`), local decode exploration (`explore_local_decode.py`),
+  tuning drivers (`tune_local_maya*.py`, `tune_ram192.py`), and service control (`tools/stop_maya.ps1`).
+- **Docs / 文档**: `docs/LOCAL-DECODE-TUNING.md`, `docs/LOCAL-MAYA-XL.md`, `docs/LOCAL-PERFORMANCE.md`,
+  `docs/DS4-STRATA-OPTIMIZATION-MAP.md` record the reasoning and measurements behind the layer
+  / 这些文档记录了本层的推理依据与实测数据。
 
-The server uses the pinned official prompt encoder, with numeric reasoning budgets and ID-matched parallel tool
-results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API details and the standalone Jinja limits.
+## Building / 构建
 
-| Files | Size | Runs on |
-| --- | ---: | --- |
-| **[Maya-S](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)**, Project Maya's own quant (default): the experts in 2-3 bits, 92.6% the same next token as the original | 340 GB, with the Engram tables (Q6_K) | NVIDIA from Volta (V100) on, and AMD; Linux and Windows |
-| unsloth's [UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (DeepSeek's own formats) | 508 GB | the same |
-| unsloth's UD-Q4_K_XL GGUF (dense weights Q8_0: less VRAM) | 501 GB | the same |
-| LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA RTX 30 / A100 and newer |
-| LibertAIDAI's [EXL3 3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) + the same Engram tables (`--ds4-quant exl3-3.5`: closer to the original, ~280 GB of VRAM + RAM) | 461 GB | the same |
+Prerequisites: MSVC 2022 (x64 developer prompt), CUDA 12.9, Python 3.13 with `cmake` and `ninja`, and a
+**pinned, locally patched llama.cpp checkout** at `third_party/llama.cpp` (gitignored — supply your own
+path via `STRATA_GGML_DIR`).
+前置：MSVC 2022（x64 开发者提示符）、CUDA 12.9、带 cmake/ninja 的 Python，以及
+`third_party/llama.cpp` 处**已钉住并打过补丁的 llama.cpp 检出**（不入库——用 `STRATA_GGML_DIR`
+指定你的路径）。
 
-- **Any amount of memory:** the most-used experts go to the GPUs, the others are read in place from the model's files -
-  from RAM where they fit, from the SSD otherwise. More VRAM and RAM is faster; keep the files on an NVMe SSD.
-- **The DSpark drafter:** with the GGUFs the setup also fetches the model's own drafter (8 GB from Maya's repo:
-  DeepSeek's FP4 experts, its dense weights in 8-bit) and measures whether drafting makes your PC faster; it keeps it
-  only where it does.
-- **Pictures:** with the GGUFs the setup fetches DeepSeek's vision tower (1 GB of its checkpoint); it runs on the first
-  GPU in about 320 MB. `--no-vision` leaves it out.
-- **One GPU or several:** the layers are split across the GPUs (pairs of equal GPUs also split each layer where the
-  files' formats allow), its thinking levels (Off, Low, High, Max) in the chat, and its own numbers in the monitor.
-- **Strix Halo / Gorgon Halo on Windows:** Windows counts the GPU's share of the memory against its page file, so the
-  setup asks for a page file big enough to keep every expert on the GPU and says the size
-  ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)).
-
-<details>
-<summary>Community quants that also run on Maya</summary>
-
-| Model | Size | How | Notes |
-| --- | ---: | --- | --- |
-| [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA only, experimental |
-| [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA only, experimental |
-
-</details>
-
-## How fast is it?
-
-Real machines, real numbers, most of them measured with `./maya.sh --bench`. A token is about ¾ of a word.
-
-| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | By |
-| --- | --- | ---: | ---: | --- |
-| **2x H100 80 GB** (PCIe 5.0), Xeon Platinum 8488C, 504 GB RAM | Maya-L / Maya-M-Derisked, 1M context | **122.4 / 123.7 tokens/s** | 2099 / 1986 tokens/s | @Molyleaf (v1.1.11, #258, #259) |
-| **4x RTX 4090 24 GB** (PCIe 4.0 x16), Xeon w7-3445, 62 GB RAM | Maya-S24 | **118 tokens/s** | 4129 tokens/s | @0xPreDa (v1.0.31, #89) |
-| **4x RTX 3090 24 GB** | Maya-S24 / Maya-M (DFlash2), 256K context | **100.8 / 86.5 tokens/s** | 979 / 907 tokens/s | @Whamp (v1.1.19, #349) |
-| **2x A100 80 GB** (PCIe 4.0 x16), EPYC 7742 (a VM, 25 threads), 161 GB RAM | Maya-M, 128K context | **91.9 tokens/s** | - | @driona-will-fluff (v1.1.19, #326) |
-| **RTX PRO 6000 Blackwell 96 GB**, Ryzen 7 9800X3D, 61 GB RAM | Maya-M, 256K context | **81.0 tokens/s** | 3102 tokens/s | @yundddd (v1.1.7, #172) |
-| **4x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2630 v4, 126-504 GB RAM, SATA SSD | Maya-S / Maya-M / Maya-L, 32K context | **69.3 / 65.1 / 42.1 tokens/s** | 622 / 630 / 558 tokens/s | @HansStrupat (v1.1.19, #327, #340) |
-| **4x Tesla V100-SXM2 32 GB** (NVLink 2.0) | Maya-S, 32K context | 68.4 tokens/s | 549 tokens/s | @jeremiahlangner (v1.1.18, #333) |
-| **1x H100 80 GB** (PCIe 5.0 x16), Xeon Platinum 8488C, 504 GB RAM | Maya-M-Derisked, 1M context | 61.4 tokens/s | 2014 tokens/s | @Molyleaf (v1.1.15, #260) |
-| **2x NVIDIA CMP 170HX 64 GB** (PCIe Gen2 x4 each), 2x Xeon E5-2690 v4, 91 GB RAM | Maya-M, every expert in VRAM | 61.3 tokens/s | 514 tokens/s | @ZackO2o (v1.0.6, #22) |
-| **2x RTX A6000 48 GB** (PCIe 4.0 x8), Core i9-13900K, 128 GB RAM, SATA SSD | Maya-S / Maya-M / Maya-L, 131K-token prompts | 60.7 / 50.9 / 32.1 tokens/s | 1726 / 1629 / 1298 tokens/s (131K) | @everson (v1.1.20, #371) |
-| **2x RTX 5880 Ada 45 GB** (PCIe 4.0 x16), Xeon Gold 5420+, 393 GB RAM | Maya-L, 256K context | 54.5 tokens/s | 1401 tokens/s | @vjsyong (v1.1.4, #149) |
-| **2x Tesla V100 32 GB** (PCIe 3.0 x16 each), 2x Xeon Gold 6138, 183 GB RAM | Maya-S24 | 54.5 tokens/s | 542 tokens/s | maintainer (v1.1.13, #226) |
-| **2x NVIDIA CMP 170HX 40 GB** (PCIe Gen2 x16 each), Xeon w3-2423, 128 GB DDR5 | Maya-S, 128K context | 54.3 tokens/s | 831 tokens/s | @nvsofts (v1.1.15, #263) |
-| **2x RTX 3090 24 GB** (PCIe 4.0 x16, NVLink, power-capped at 252 W), Threadripper PRO 3975WX, 512 GB RAM | Maya-M / Maya-L, 128K context | 54.1 / 40.3 tokens/s | 936 / 850 tokens/s | @ksim63-gif (v1.1.23, #404) |
-| **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 53.0 tokens/s | 885 tokens/s | @briepala (v1.1.2, #135) |
-| **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 128K context | 52.9 tokens/s | 616 tokens/s | @noahark (v1.1.20, #346) |
-| **4x Tesla V100 32 GB** (PCIe 3.0 x16), 24 CPU cores, a 100 GiB RAM limit | Maya-L, 32K context | 48.3 tokens/s (after `--calibrate`) | 499 tokens/s | @areslp (v1.1.3, [#130](https://github.com/mw00/project-maya/issues/130)) |
-| **4x RTX 3090 24 GB** (PCIe 4.0 x8 behind one switch), Xeon Platinum 8260M, 376 GB RAM | Maya-L, 1M context | 44.2 tokens/s (tuned) | 698 tokens/s | @foureight84 (v1.1.17, #302) |
-| **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x8 each), Ryzen 5 3600, 64 GB RAM | Maya-S24 / Maya-M-Derisked, 256K context | 44.1 / 24.9 tokens/s | 704 / 617 tokens/s | @gegnep (v1.1.20, #395) |
-| **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 250 W), EPYC 7452, 256 GB RAM | Maya-M / Maya-L, 128K context | 44.0 / 30.2 tokens/s | 860 / 801 tokens/s | @orochifj (v1.1.4, #165) |
-| **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
-| **2x Tesla V100 32 GB** (PCIe 3), Xeon E5-2690 v4, 30 GB RAM | Maya-S | up to 40 tokens/s | up to 670 tokens/s | maintainer |
-| **4x Tesla T10 15 GB** (PCIe 3.0 x16), Xeon E5-2680 v4, 63 GB RAM | Maya-S24, 100K context | 38.4 tokens/s | 393 tokens/s | @zeallag (v1.1.16, #291) |
-| **2x Tesla V100 32 GB** (PCIe 3.0 x8 each), Ryzen 9 7945HX3D, 96 GB RAM | Maya-M / Maya-L | 33.8 / 13.3 tokens/s | 490 / 372 tokens/s | @nkhaooat (v1.1.11, #208) |
-| **RTX 3090 24 GB + RTX 3060 12 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 33.7 tokens/s | 682 tokens/s | @erikash (v1.1.4, #157) |
-| **RTX 5090 32 GB**, Ryzen 9 7950X, 96 GB DDR5 | Maya-M | 30+ tokens/s | ~2000 tokens/s | @siganos (#43) |
-| **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB LPDDR5X, 160 GB of it for the GPU), Windows 11 | Maya-S, 32K context | up to 29.6 tokens/s (23.2 after an 8K-token prompt) | 278 tokens/s | maintainer (v1.1.10) |
-| **2x RTX 3090 24 GB** (PCIe 4.0 x16, NVLink), Threadripper PRO 3955WX, 247 GB RAM | EXL3-3.05bpw, 128K context | 29.2 tokens/s | - | @catonooka (v1.1.9, #187) |
-| **2x Tesla P40 24 GB** (Pascal, PCIe 3.0 x16), EPYC 7302P (a VM), 184 GB RAM | Maya-S24 / Maya-L | 28.0 / 16.9 tokens/s | 202 / 194 tokens/s | @Jw88888 (v1.1.11 + #214, #212) |
-| **RX 7900 XTX 24 GB + Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB) | Maya-S24, 114K-token prompts | 27.5 tokens/s | 836 tokens/s (114K) | @pepuscz (v1.1.17, #311) |
-| **1x RTX 3090 24 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 27.0 tokens/s | 1069 tokens/s | @erikash (v1.1.4, #157) |
-| **1x Tesla V100 32 GB** (PCIe 3), 2x Xeon Gold 6138, 183 GB RAM | Maya-S24 | 26.8 tokens/s | 541 tokens/s | maintainer (v1.1.7, #171) |
-| **RTX 4080 SUPER 32 GB** (a 32 GB modded card), Threadripper 3970X, 157 GB RAM, SATA SSD | Maya-S24, 262K context | 26.7 tokens/s | 1552 tokens/s | @Micro-ATP (v1.1.11, #200) |
-| **3x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2690 v4, 62 GB RAM | Maya-S, 128K context | 26.6 tokens/s | 497 tokens/s | @saatvik-viniak (v1.1.11, #211) |
-| **4x RTX 3080 20 GB**, 64 GB DDR4 | Maya-M, 512K context | 26.3 tokens/s (a day of use) | - | @CoolJohn-lab (#104) |
-| **1x RTX 3090 24 GB** (power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 26.0 tokens/s | 913 tokens/s | @briepala (v1.1.2, #135) |
-| **RTX PRO 4000 Blackwell 24 GB**, Core i9-13900K, 128 GB DDR5 | Maya-S24 | 24.7 tokens/s | 1146 tokens/s | @morrisfamily (v1.1.7, #174) |
-| **RTX 5090 32 GB** (PCIe 5.0 x16), Core i9-13900K, 64 GB RAM, Windows 11 | Maya-S, 128K context | 23.0 tokens/s | 2173 tokens/s | @gianbing (v1.1.3, #139) |
-| **4x Tesla T4 16 GB**, Xeon E5-2660 v2, 220 GB RAM | Maya-S | 22.6 tokens/s | 416 tokens/s | @ksanislo (v1.0.16, #36) |
-| **Radeon AI PRO R9700 32 GB** (gfx1201), Core i5-14400F, 128 GB RAM | Maya-S | 21.4 tokens/s | - | @potatopote-debug (v1.1.12, #213) |
-| **1x NVIDIA CMP 170HX 64 GB** (PCIe Gen2 x16), Core i7-9700K, 32 GB RAM | Maya-S24, 32K context | 20.6 tokens/s | 797 tokens/s | @Kanorin-chan (v1.1.8, #281) |
-| **1x Tesla V100 32 GB** (PCIe 3), Core i5-12600T, 64 GB RAM | Maya-S | up to 19 tokens/s | up to 620 tokens/s | maintainer |
-| **AMD Radeon 8060S** (Ryzen AI Max+ 395, 128 GB, 96 GB of it for the GPU), Windows 11 | Maya-S | 18.3 tokens/s | 320 tokens/s | @LIN-LAB-AI (v1.0.30, #102) |
-| **RTX 3090 Ti 24 GB** (PCIe 3.0 x16, a VM), EPYC 7302P, 240 GB RAM | Maya-L, 32K context | 18.2 tokens/s (tuned, #177) | 791 tokens/s | @Jw88888 (v1.1.7, #177) |
-| **RTX 4090 24 GB**, Ryzen 7 9700X, 64 GB RAM | Maya-S24, 32K context | 16.6 tokens/s | 1320 tokens/s | @MagikEh (#274) |
-| **NVIDIA DGX Spark** (GB10, 121 GB unified memory) | Maya-S, 128K context | 16.5 tokens/s | ~730 tokens/s (6K prompt) | @ericoh88 (v1.1.15, #282) |
-| **RTX 4090 24 GB**, Ryzen 9 9950X3D, 192 GB DDR5, Windows 11 | Maya-L, 128K context | 16.4 tokens/s | 1371 tokens/s | @npc97 (v1.0.24, #63) |
-| **RTX 5090 Laptop 24 GB**, Core Ultra 9 275HX, 64 GB RAM, Windows 11 (a laptop) | Maya-S24 | 14.5 tokens/s | 994 tokens/s | @klvnblst (v1.0.30, #67) |
-
-Prefill is an 8K-token prompt. The speed holds as a conversation grows, and the first answers after a start are the
-slowest while the caches fill with what you use. Share yours: `--bench`, then `--report`, in a
-[GitHub issue](https://github.com/mw00/project-maya/issues).
-
-**DeepSeek-V4.1-Flash-1017** (`maya-ds4`):
-
-| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | By |
-| --- | --- | ---: | ---: | --- |
-| **4x AMD Instinct MI100 32 GB** (gfx908, PCIe 4.0 x16 each), EPYC 7402, 252 GB RAM | Maya-XS, 32K context | **51.8 tokens/s** | 172 tokens/s | @nsaxploit (v1.1.22, #396) |
-| **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | Maya-S, a 130K-token prompt | 37.1 tokens/s (42.8 with the prompt cached) | 155 tokens/s (130K) | @pepuscz (v1.1.21 + its own changes, #410) |
-| **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-XS, 64K context | 21.5 tokens/s | 573 tokens/s | @fuad00 (v1.1.22, #393) |
-
-**Several requests at once** (`--parallel`) add up: on one GPU a token of each goes through the model together, so
-the dense weights are read once for all of them. In tokens per second for all of them together, against the same
-questions one after another: x1.41 for two and x1.35 for four on a V100 that streams most of Maya-S's experts from
-RAM, x1.67 for two and x2.02 for four on a Gorgon Halo (Radeon 8065S, 160 GB for the GPU) that holds every expert in
-GPU memory. The more of the model
-VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once)).
-
-## What you need
-
-| | |
-| --- | --- |
-| **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; GLM-5.3-Flash reads text only there, DeepSeek-V4.1-Flash-1017 pictures too - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
-| **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
-| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for Maya-S, ~160 GB for Maya-L, ~350 GB for DeepSeek-V4.1-Flash-1017's Maya-S, ~520 GB for unsloth's GGUF) and its picture encoder (1.1 GB). Not a hard disk |
-| **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100 or Pascal), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
-
-The setup checks all of this, prints the exact command for anything missing, and installs nothing system-wide.
-
-## Install
-
-```sh
-git clone https://github.com/mw00/project-maya.git && cd project-maya
-./setup.sh
+```bat
+cmake -S . -B build -G Ninja ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_CUDA_ARCHITECTURES=native ^
+  -DMAYA_BUILD_DS4=OFF -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF ^
+  -DSTRATA_NATIVE_EXPERTS=ON ^
+  -DSTRATA_GGML_DIR=<path-to-pinned-llama.cpp>
+ninja -C build maya
 ```
 
-Answer a few questions (Enter takes the recommended choice). The setup shows every download before it starts it,
-builds everything once (20-40 minutes plus the download) and **starts the model**. Then open
-`http://127.0.0.1:8080`. Ctrl+C stops it, and `./setup.sh` starts it again right away.
+- `native` detects the local GPUs' architectures (here: sm_70 + sm_120) / `native` 自动探测本机架构。
+- Build **only the `maya` target** — see Known quirks / 只编 `maya` 目标——见“已知怪癖”。
+- The engine executable is referenced by a runtime config's `exe` field; `maya.py` starts the serve
+  layer: `python maya.py --config <config.json> --port <port>` / 引擎可执行文件由运行配置的
+  `exe` 字段指向；`maya.py` 启动服务层。
 
-- **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
-- **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
-- **Updating:** the dashboard's **About > Update**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
-- **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
+## Running / 运行
 
-> **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,
-> so other programs get little RAM while Maya runs.
+The serve layer speaks the OpenAI- and Anthropic-compatible API (chat completions, tool calls, multiple
+concurrent requests) and hosts the browser chat + monitor. Runtime configs are machine-local
+(gitignored); upstream's `setup.py` generates them and downloads the model quants from Hugging Face.
+服务层提供 OpenAI/Anthropic 兼容 API（chat completions、工具调用、多请求并发）并托管浏览器聊天页
+与监视器。运行配置是机器本地的（不入库）；上游的 `setup.py` 负责生成配置并从 Hugging Face
+下载模型量化。
 
-## Using it
+## Tuning target & measured state / 调优目标与实测状态
 
-- **In the browser:** chat (kept in your browser, per-chat instructions, edit and regenerate, HTML previews), a live
-  **Monitor** of the model and your hardware (down to what fills each GPU's memory), and a context size and port you
-  can change in Settings.
-- **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
-  `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`). Tool calls are
-  streamed as the model writes them, and a long prompt's reading progress too when a request asks for it
-  (`"return_progress": true`). A web page served from another address can call it too once you allow its
-  address (`"cors_origins"`, [docs/SETUP.md](docs/SETUP.md#web-pages-on-another-address)).
-- **Responses API:** `/v1/responses` supports text/image conversations, streaming,
-  function tool calls, schema-validated output, background tasks with cancellation/replay,
-  and optional shared in-memory history (`store:true`, `previous_response_id`).
-  Responses are not stored by default. Options and limits: [docs/RESPONSES.md](docs/RESPONSES.md).
-- **Thinking:** Off, Low, High (the default) or Max, in Settings or per request.
-- **Pictures:** attach one in the chat, or send image parts through either API.
-- **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
-  [docs/SETTINGS.md](docs/SETTINGS.md).
-- **DeepSeek on large-RAM Linux hosts:** optional [locked Engram tables and strict CPU-expert RAM placement](docs/SETTINGS.md#deepseek-explicit-ram-residency). Both are off by default; they need enough physical RAM.
-- **Several requests at once** (GLM-5.3-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
-  it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
-  context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).
-- **Long contexts** (GLM-5.3-Flash): new setups keep each attention layer's cache in RAM with a window of it in VRAM
-  (`--kv-streaming on`; `./maya.sh --setup` adds it to an existing config), so the VRAM holds more experts - at 512K
-  on an RTX 3090, prompts 4-9x faster and decode +5%; 1M context fits one 3090
-  ([how](docs/SETTINGS.md)).
-- **Faster answers with a DFlash2 drafter** (GLM-5.3-Flash): `./maya.sh --setup --draft dflash2` (NVIDIA RTX 30 / A100 and newer)
-  downloads a small drafter that drafts up to 7 tokens a round and gives the same answers - Maya-L +44% on nine GPUs
-  and +12% on two (against the MTP block), +19% on one RTX 3090 ([how](docs/SETTINGS.md#drafting-with-dflash2)). How
-  much it gains depends on the PC: on one GPU that reads much of the model from RAM it is often slower. So a
-  [speed calibration](docs/SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is
-  faster. The drafter's license is non-commercial (CC BY-NC-ND 4.0).
+This fork's reference rig: **1× GeForce RTX 5090 D (sm_120) + 2× Tesla V100-class PG500-216 (sm_70)**,
+192 GB host RAM; MoE layers split across the three GPUs, int8 KV cache, MTP drafting enabled.
+Measured there: ~30 tokens/s sustained decode around an 8K context, ~1400 tokens/s prefill, and verified
+operation past 256K context. Your numbers will differ; the engine self-measures and adapts.
+本 fork 的参考机型：**1× GeForce RTX 5090 D (sm_120) + 2× Tesla V100 级 PG500-216 (sm_70)**，
+192 GB 内存；MoE 层拆到三卡，int8 KV 缓存，开启 MTP 起草。实测：8K 上下文附近持续 decode
+约 30 tokens/s，prefill 约 1400 tokens/s，256K 以上上下文验证可跑。你的数字会不同；
+引擎会自测量并自适应（上游特性）。
 
-### DeepSeek: conversations kept
+## Verification discipline / 验证纪律
 
-The DeepSeek-V4.1-Flash-1017 engine holds one conversation: a prompt that continues it reuses its state, anything else
-starts over. With this on, a conversation another request takes the model from - a chat, or an agent's parent and
-workers - is set aside, and a request that continues it reads only its new tokens: in RAM, or across a restart from
-the folder. Off by default; the config sets them under the same `MAYA_DS4_*` names
-([how](docs/SETTINGS.md#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)):
+Every optimization adopted here went through a measured A/B before adoption: an isolated engine instance
+on a private port, fixed-seed prompts with needle/checksum probes, a prefill negative control (the change
+must not move prefill unless it claims to), and a known noise band (±0.55% on this rig's decode). Features
+that do not measure up are reverted. LOSSY knobs additionally record answer-drift before adoption.
+这里采纳的每一项优化都先经过实测 A/B：私有端口上的隔离引擎实例、固定种子提示 + 召回/校验探针、
+prefill 阴性对照（改动不许碰 prefill，除非它声称如此）、已知噪声带（本机 decode ±0.55%）。
+不达标的特性一律回退；有损开关在采纳前还要记录答案漂移。
 
-| Setting | Default | |
-| --- | --- | --- |
-| `STRATA_DS4_SLOT_KEEP` | off | `1`: conversations are set aside when another one takes the model, and kept across runs in the folder; `0`: every switch reads its prompt from token 0, as before |
-| `STRATA_DS4_SLOT_CAP` | 4 | conversations kept in RAM (tens to hundreds of MB each); past it the least recently used is written to the folder and read back from there; `0` = none |
-| `STRATA_DS4_SLOT_GB` | 16 | the folder's total size (GB, its `.bin` files): past it the folder's least recently used conversation is removed - never the one just written, so a conversation bigger than the cap stays |
-| `STRATA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size) |
-| `STRATA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
-| `STRATA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete |
+## Merging future upstream releases / 合并上游新版本
 
-## Something went wrong?
+The pristine ancestor makes upgrades a standard 3-way merge / 纯净祖先让升级成为标准三路合并：
 
-Run **`./maya.sh --report`** (Windows: `START-MAYA.bat --report`) right after a slow answer or an error, and attach the
-`maya-report.txt` it writes to a [GitHub issue](https://github.com/mw00/project-maya/issues). It holds your hardware,
-your setup and the engine's speed lines; nothing is sent anywhere by itself. The engine's own log is
-`maya-<model>.log` in the Maya folder.
+```bash
+git remote add upstream <upstream-repo-url>   # fetch-only / 只 fetch
+git fetch upstream --tags
+git checkout -b upgrade-vX.Y.Z
+git merge vX.Y.Z    # 3-way: merge base = v1.1.26 pristine / 合并基 = v1.1.26 纯净树
+```
 
-- **"nvcc ... cannot build for these GPUs":** Volta needs CUDA 12.x, Blackwell 12.8 or newer. The setup takes the
-  newest installed toolkit that fits.
-- **`cuda_profiler_api.h` or `nvtx3/nvToolsExt.h` is missing:** Maya's CUDA build needs the profiler API
-  and NVTX headers as well as `nvcc` and the runtime. Install those development components for your toolkit.
-  With a split CUDA 13 toolkit, NVIDIA's official header wheels can also stay in a project-local folder:
+Conflicts concentrate where the local layer touches files upstream rewrote (`src/core/glm_fast_path.cu`
+is the usual suspect). Validate every merged feature with the same A/B battery before adopting.
+冲突集中在本地层与上游重写相交的文件上（`src/core/glm_fast_path.cu` 是常客）。每个合并进来的
+特性都要用同一套 A/B 流程验证后再采纳。
 
-  ```sh
-  python3 -m pip install --target .cuda-headers \
-    nvidia-cuda-profiler-api==13.3.27 nvidia-nvtx==13.3.29
-  CPATH="$PWD/.cuda-headers/nvidia/cu13/include${CPATH:+:$CPATH}" ./maya.sh --setup
-  ```
+## Known quirks / 已知怪癖
 
-  Select wheel versions that match your toolkit. This include layout was checked with CUDA 13.3,
-  `nvidia-cuda-profiler-api==13.3.27` and `nvidia-nvtx==13.3.29`; other CUDA major versions can use a
-  different layout. Use the same `CPATH` when rebuilding after an update. No shared toolkit files need changing.
-- **"unsupported GNU version":** `./maya.sh --setup --host-compiler g++-12` (install `g++-12` first).
-- **Slow, with the SSD busy all the time:** not enough free RAM for the experts. Close programs or add RAM.
-- **Windows: answers suddenly several times slower:** the card is too full and Windows moves GPU memory to RAM. Leave
-  more of it free: `START-MAYA.bat --setup --vram-reserve-mib 2048`
-  ([the expert pool's size](docs/SETTINGS.md#the-expert-pools-size)).
-- **Windows on a Strix Halo / Gorgon Halo: other programs run out of memory, or the setup warns about the page
-  file:** set the page file to the size the setup prints ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)).
-- **The download stopped:** run `./maya.sh` again; it continues where it stopped.
-- **Port 8080 is in use:** Maya is already running, or `--port 8081` starts another one. Settings > Port moves Maya to
-  another port for good (it starts again there).
+- `src/kernels/native_expert_parity.cpp` (a standalone parity tool, not part of `maya.exe`) uses a
+  variable-length array that MSVC rejects; building **all** targets fails on it. Build the `maya` target
+  only, or fix the tool to use `std::vector`.
+  `native_expert_parity.cpp`（独立对拍工具，不属于 `maya.exe`）用了 MSVC 不接受的变长数组；
+  **全量**构建会在它上面失败。只编 `maya` 目标，或把该工具改成 `std::vector`。
+- `third_party/llama.cpp` is a gitignored pinned checkout: a fresh clone must supply it before building.
+  `third_party/llama.cpp` 是不入库的钉住检出：新克隆必须先提供它才能构建。
+- `bench/micro/*.txt` fixtures are generated (upstream gitignores them); regenerate with the upstream
+  tools if the PLE parity tests need them.
+  `bench/micro/*.txt` fixture 是生成物（上游同样不入库）；PLE 对拍测试需要时用上游工具再生成。
 
-## Support
+## License / 许可
 
-Project Maya is free and open source. If it's useful to you, you can support it here - thank you!
-
-<p align="center"><a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
-
-Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says what helps most.
-
-## Credits and license
-
-- **People:** Project Maya is created and led by Peasant Smith ([@mw00](https://github.com/mw00),
-  [X](https://x.com/PeasantSmith)), who owns the project, its name and the Maya models.
-  [@needmorevram](https://github.com/needmorevram) ([X](https://x.com/needmorevram)) is a co-maintainer and
-  contributed major features: DFlash2 drafting, EXL3 support, KV streaming,
-  conversation checkpoints, the layer-split search, the expert profile and the CPU expert kernels, and for
-  `maya-ds4` the 3.5-bit EXL3 option, tensor parallel over 4 / 8 GPUs and the threaded expert-cache swaps (#276). Thanks also to everyone who sent code and speed reports
-  ([contributors](https://github.com/mw00/project-maya/graphs/contributors)).
-- **Built on [Strata](https://github.com/Niko1221/Strata)** (MIT License, Copyright (c) 2026 Niko1221 and the Strata
-  contributors): Maya's engine started from Strata's and was rewritten for GLM-5.3-Flash (the expert tiers across VRAM,
-  RAM and SSD, the layer split, MTP decoding), and its server and dashboard grew from Strata's. **And on
-  [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml
-  authors): the quantization formats, the CPU dot products and the prompt path's MMQ kernels, built from a pinned
-  commit (`third_party/ggml/LICENSE`).
-- **EXL3 support** follows [exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks, CPU expert
-  kernel and tensor-core decoding of a tile (MIT License, Copyright (c) 2025 Turboderp; `third_party/exllamav3/LICENSE`). **The DFlash2 drafter's
-  forward** follows [beellama.cpp](https://github.com/Anbeeld/beellama.cpp)'s (MIT License, Copyright (c) 2023-2026
-  The ggml authors, Anbeeld; `third_party/beellama.cpp/LICENSE`).
-- The models: [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) by zai-org (MIT); Maya's quants and the
-  image encoder file are made from zai-org's released weights and keep its license.
-  [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) by DeepSeek (MIT); Maya's
-  quant, its Engram tables and the drafter are made from DeepSeek's released weights and keep its license; the vision
-  tower comes from DeepSeek's checkpoint, the GGUF option from
-  [unsloth's GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), the EXL3 options are
-  LibertAIDAI's ([2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) and
-  [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)). The optional DFlash2 drafter
-  ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF) by Anbeeld) is CC BY-NC-ND
-  4.0, non-commercial use only, and is downloaded only when you choose it.
-- The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`).
-- Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
-  with every copy.
+This fork carries the upstream license files verbatim (`LICENSE`, `LICENSE.deepseek-v41`). The model
+weights have their own terms — GLM-5.3-Flash and DeepSeek-V4.1-Flash are MIT per their publishers, while
+Maya's quantized GGUF releases follow the upstream project's terms.
+本 fork 原样保留上游许可证文件（`LICENSE`、`LICENSE.deepseek-v41`）。模型权重遵循各自的条款：
+GLM-5.3-Flash 与 DeepSeek-V4.1-Flash 按发布方为 MIT，Maya 量化 GGUF 遵循上游项目的发布条款。
