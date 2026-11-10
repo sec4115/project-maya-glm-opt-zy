@@ -37,6 +37,17 @@ path also off-loads cold experts to a CPU lane that computes them on the host.
 This fork builds the engine for **Volta (sm_70) through Blackwell (sm_120)** — Volta support is re-enabled
 locally (upstream dropped it from the default path).
 
+## The model quantization in use
+
+All tuning and measurements in this fork revolve around one model artifact: **GLM-5.3-Flash** (zai-org,
+MIT; 321 B parameters, ~18 B active per token, up to 1 M context) in **unsloth's UD-Q4_K_XL dynamic
+4-bit quantization** (`GLM-5.3-Flash-UD-Q4_K_XL.gguf`, from the
+[unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) repository's UD-Q4_K_XL
+folder — 6 split volumes, ~200 GB total, keeping ~93% of the FP8 model's accuracy by Unsloth's figures),
+loaded together with the model's own MTP drafting block. The measured figures below (≈30 tokens/s
+sustained decode at 8K context, ≈1400 tokens/s prefill, verified past 256K context) all reference this
+quantization.
+
 ## The local optimization layer
 
 Grouped by concern; the interesting entry points are `include/strata/core/*.hpp` and

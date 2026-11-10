@@ -31,6 +31,16 @@ decode 路径还会把冷专家交给 CPU lane 在主机侧计算。
 本 fork 把引擎编译目标覆盖 **Volta (sm_70) 到 Blackwell (sm_120)**——其中 Volta 支持是本地
 重新放行的（上游默认路径已移除）。
 
+## 面向的模型量化
+
+本 fork 的调优与全部实测围绕一个模型产物展开：**GLM-5.3-Flash**（zai-org，MIT；321B 参数、
+约 18B 每 token 激活、最高 1M 上下文）的 **unsloth UD-Q4_K_XL 动态 4-bit 量化**
+（`GLM-5.3-Flash-UD-Q4_K_XL.gguf`，来自
+[unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) 仓库的
+UD-Q4_K_XL 目录，分 6 卷、共约 200 GB，官方口径保留约 93% 的 FP8 精度），
+随模型自带的 MTP 起草模块一起加载。本文中的实测数据（8K 上下文持续 decode 约 30 tokens/s、
+prefill 约 1400 tokens/s、256K+ 上下文验证可跑）均以该量化为基准。
+
 ## 本地优化层
 
 按关注点分组；入口主要在 `include/strata/core/*.hpp` 与 `src/core/glm_fast_path.cu`：
