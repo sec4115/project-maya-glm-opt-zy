@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -41,6 +41,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC AND NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
   set(CMAKE_SYSTEM_PROCESSOR "AMD64")
   message(STATUS "Maya: inferred missing CPU architecture AMD64 from MSVC x64 target")
+endif()
 
 
 # x86 gets the AVX-512/AVX2 expert kernels; other architectures (aarch64: DGX Spark / Grace) take the
