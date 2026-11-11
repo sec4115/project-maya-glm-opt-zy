@@ -25,6 +25,12 @@ Upstream: **Project Maya** by Peasant Smith ([@mw00](https://github.com/mw00)); 
   upstream's own `.gitignore` conventions are kept.
 - **Not the upstream project**: upstream's README, benchmarks and release announcements live in the
   upstream repository; this fork documents only its own delta.
+- **Upstream source policy**: `D:\project-maya` is the local checkout of maya's upstream git
+  repository (a read-only reference). The only operations allowed on it are the repository's own
+  updates (fetch / pull of new upstream versions); **any other write is forbidden** (no editing its
+  files, no building inside it, nothing moved or deleted). All syncing with upstream happens on
+  THIS side: `git fetch upstream` pulls upstream objects into this repository, and merging,
+  conflict resolution, builds and validation all live in `D:\project-maya-main`.
 
 ## The engine in one paragraph
 
