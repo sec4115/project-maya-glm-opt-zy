@@ -23,6 +23,7 @@ Upstream: **Project Maya** by Peasant Smith ([@mw00](https://github.com/mw00)); 
 - **What is deliberately NOT here**: model weights (GGUF), runtime configs (`maya-*.json`), logs,
   benchmark result sets, `data/` fixtures, build outputs. They are machine-local and regenerable;
   upstream's own `.gitignore` conventions are kept.
+- **Window-watchdog convention**: any planned model-service outage/restart registers a scheduled poll per docs/OPS-WATCHDOG.md (threshold = estimate x 50%, 60 s interval, self-cancels on recovery; a manual user wake cancels it).
 - **Not the upstream project**: upstream's README, benchmarks and release announcements live in the
   upstream repository; this fork documents only its own delta.
 - **Upstream source policy**: `D:\project-maya` is the local checkout of maya's upstream git
