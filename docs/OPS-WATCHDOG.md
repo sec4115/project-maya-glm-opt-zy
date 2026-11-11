@@ -25,6 +25,11 @@ Bilingual, concise. 中文在前，English mirrors it.
 - 估计 T = 70 分钟 → 阈值 = 35 分钟 → `DTSTART` = 开窗 + 35 分钟，`RRULE:FREQ=MINUTELY;UNTIL=<+6h>Z`。
 - 轮询目标：`http://127.0.0.1:8080/health`（生产）。
 
+### 双轨实现（脚本内 vs 定时任务）
+
+- **窗口内脚本化**（会话在窗口中活跃时优先）：`bench/results/backend_watchdog.py --threshold-s <T×50% 秒> --interval-s 60 --url <health> --tag <任务名>`——阶段A 即在用（reason-chain-ab 用 2400s/60s，round2 用 720s/60s），同窗口内完成轮询与收尾。
+- **定时任务轨**（跨回合/跨会话长窗口）：本文档第 3-5 条的 `schedule_create` 规程——阈值后每 60 s 触发一次会话检查，恢复即自撤，用户手动唤醒即撤。阶段B 两个生产窗口均按此执行（估计 70 分钟 → 阈值 35 分钟；第二个窗口实测 8 分钟，watchdog 到点即见恢复并自撤）。
+
 ## English
 
 For any **planned model-service outage or restart** (production window, exe swap, engine restart, two-arm battery, ...), register a window watchdog as a scheduled task:
