@@ -27,6 +27,9 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
+#include "strata/core/glm_split_devices.hpp"
+#include "strata/platform/env_switch.hpp"
+
 #include "ggml.h"
 
 #include <cuda_runtime.h>
@@ -841,6 +844,7 @@ void Glm5Model::reset() {
     if (fast_ != nullptr) {
         cudaMemsetAsync(state_, 0, state_bytes_, fast_->cs);
         kv_stream_reset_maps();   // (the zeroed slots hold no block now - on the same stream)
+        if (fast_->md.route_err_d != nullptr) cudaMemsetAsync(fast_->md.route_err_d, 0, sizeof(int), fast_->cs);
         if (cudaStreamSynchronize(fast_->cs) == cudaSuccess && fast_->route_error_h)
             *fast_->route_error_h = 0;   // a failed route belongs to the previous request
     } else {
@@ -1353,6 +1357,12 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             }
         for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get()) p->prefill_cap(tmin, "the split's smallest");
     }
+    // STRATA_GLM_HELPER_CHECK: each part's expert helper against its own GPU, once every part's helper is open
+    for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get())
+        if (!p->fast_helper_check(err)) {
+            split_next_.reset();
+            return false;
+        }
     cudaSetDevice(dev_);
     std::fprintf(stderr, "glm split: layers %s (one 64 KB host hop per boundary per token)\n", where.c_str());
     return true;
@@ -1575,7 +1585,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     bool mtp = false;
     double mtp_dense = 0;
     std::unique_ptr<strata::GgufFile> extra;
-    if (fast && n == 2 && getenv("STRATA_GLM_NO_MTP") == nullptr) {
+    if (fast && n == 2 && !strata::platform::env_switch("STRATA_GLM_NO_MTP")) {
         const std::string P = "blk." + std::to_string(L) + ".";
         const char* mg = getenv("STRATA_GLM_MTP_GGUF");
         if (find(P + "nextn.eh_proj.weight") == nullptr && mg != nullptr && mg[0] != '\0') try {
@@ -1617,7 +1627,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             mtp = true;
         }
     }
-    const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr;
+    const bool pipelined = n == 2 && mtp && !strata::platform::env_switch("STRATA_GLM_NO_SPEC");
     // a DFlash drafter's pipelined window (dflash_pipelined): the anchor crosses every part, and each draft kept behind
     // it costs about the slowest part, so a round of a kept drafts costs sum + a * slowest for a + 1 tokens (a ~1.5 at
     // the pipelined window's default cut); the batched one crosses the parts in turn (the parts added)
@@ -1932,7 +1942,7 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
                               const std::string& layer_split) {
     if (const char* df = getenv("STRATA_GLM_DFLASH"); df != nullptr && df[0] != '\0') {
         dflash_path_ = df;
-        if (getenv("STRATA_GLM_NO_MTP") == nullptr) {
+        if (!strata::platform::env_switch("STRATA_GLM_NO_MTP")) {   // (unset, or 0 / off: it is set to 1)
 #if defined(_WIN32)
             _putenv_s("STRATA_GLM_NO_MTP", "1");
 #else
@@ -1954,14 +1964,19 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
+    // STRATA_GLM_EXPERT_HELPER=<device>: the expert helper - alone beside one trunk GPU (no split: dense, state and
+    // MTP stay on device 0), or beside a layer split, which then leaves the helper's device out and gives each part
+    // its own share of the helper over its own layers (fast_helper_setup): two cards and a Ryzen AI Max APU
+    int helper = -1;
     if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
-        if ((!spec.empty() && spec != "0") || std::strspn(h, "0123456789") != std::strlen(h)) {
-            err = "GLM expert helper: give a helper device index, without a layer split";
+        if (std::strspn(h, "0123456789") != std::strlen(h)) {
+            err = "GLM expert helper: give a helper device index";
             return false;
         }
+        helper = std::atoi(h);
         double free_gib = 0;
-        if (!RemoteExperts::preflight(std::atoi(h), free_gib, err)) return false;
-        return load_pack(pack_dir, max_ctx, err);   // dense/state/MTP stay on device 0
+        if (!RemoteExperts::preflight(helper, free_gib, err)) return false;
+        if (spec.empty() || spec == "0") return load_pack(pack_dir, max_ctx, err);
     }
     const auto ints = [](const std::string& s, std::vector<int>& out) {
         out.clear();
@@ -1977,8 +1992,9 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     int n_dev = 0;
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
     cudaGetLastError();
-    std::vector<int> bounds, devs;
-    if (const char* dv = getenv("STRATA_GLM_DEVS"); dv != nullptr && !ints(dv, devs)) {
+    std::vector<int> bounds, devs, named;
+    const char* dv = getenv("STRATA_GLM_DEVS");
+    if (dv != nullptr && !ints(dv, named)) {
         err = std::string("MAYA_GLM_DEVS: not a device list: ") + dv;
         return false;
     }
@@ -1987,11 +2003,10 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
             err = "glm split: not a layer list (K or K1,K2,..): " + spec;
             return false;
         }
-        if (devs.empty())
-            for (int i = 0; i <= (int) bounds.size(); ++i) devs.push_back(i);
+        if (!glm_split_devices(dv != nullptr ? &named : nullptr, n_dev, helper, (int) bounds.size() + 1, (int) kMaxParts,
+                               devs, err)) return false;
     } else {
-        if (devs.empty())
-            for (int d = 0; d < std::min(n_dev, (int) kMaxParts); ++d) devs.push_back(d);
+        if (!glm_split_devices(dv != nullptr ? &named : nullptr, n_dev, helper, 0, (int) kMaxParts, devs, err)) return false;
         if (devs.size() < 2) return load_pack(pack_dir, max_ctx, err, devs.empty() ? 0 : devs[0]);
         if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr)
             if (const char* d1 = getenv("STRATA_GLM_DEV1")) devs[1] = std::atoi(d1);
@@ -2003,7 +2018,8 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
             bounds = glm_search_bounds(pack_dir, max_ctx, devs);
         if (bounds.empty() && devs.size() == 2)
             bounds = {g_.n_layers / 2 +
-                      (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr ? 2 : 0)};
+                      (!strata::platform::env_switch("STRATA_GLM_NO_MTP") &&
+                               !strata::platform::env_switch("STRATA_GLM_NO_SPEC") ? 2 : 0)};
         if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, g_.n_layers, devs);
     }
     if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr && !spec.empty() && spec != "auto")
@@ -2012,7 +2028,7 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     for (size_t i = 0; ok && i < bounds.size(); ++i)
         ok = bounds[i] >= 1 && bounds[i] < g_.n_layers && (i == 0 || bounds[i] > bounds[i - 1]);
     for (size_t i = 0; ok && i < devs.size(); ++i) {
-        ok = devs[i] >= 0 && devs[i] < n_dev;
+        ok = devs[i] >= 0 && devs[i] < n_dev && devs[i] != helper;   // (STRATA_GLM_DEV1 may not name the helper either)
         for (size_t j = 0; ok && j < i; ++j) ok = devs[i] != devs[j];
     }
     if (!ok) {
@@ -3349,12 +3365,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
     // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
+    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) &&
+        !strata::platform::env_switch("STRATA_GLM_NO_MTP") &&
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
-        // the draft head's vocabulary (the one-GPU MTP decode; several conversations drafting, STRATA_GLM_MULTI_MTP)
-        if (mtp_il_ >= 0 && (mtp_one || multi_mtp_setting() > 0)) mtp_vocab_scan(gfs);
+        // the draft head's vocabulary (the one-GPU MTP decode, decode_spec, decode_spec_pipe, STRATA_GLM_MULTI_MTP)
+        if (mtp_il_ >= 0) mtp_vocab_scan(gfs);
     }
 
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the
@@ -3533,13 +3550,20 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         size_t pool_bytes_cap = pool_avail;
         if (const char* ps = getenv("STRATA_GLM_POOL_SLOTS0"))
             pool_bytes_cap = std::min<size_t>(pool_avail, (size_t) std::atoi(ps) * slot_bytes_);
-        // per-class bytes proportional to that class's byte demand
+        // every class first gets one route's worth of slots (n_exp_used): a token's experts for a layer must all be
+        // resident at once, and a rare class (one layer of a different recipe - GLM-5.3 UD-Q2_K_XL's layer 8) given
+        // fewer evicted its own route's experts before the kernel read them.  The rest is proportional to demand.
+        size_t floor_b = 0;
+        for (int c = 0; c < pool_nclasses_; ++c) floor_b += (size_t) g_.n_exp_used * c_stride[(size_t) c];
+        const size_t share_b = pool_bytes_cap > floor_b ? pool_bytes_cap - floor_b : 0;
         size_t off = 0;
         int64_t base = 0;
         int64_t slots_total = 0;
+        bool every_class = true;
         for (int c = 0; c < pool_nclasses_; ++c) {
             class_stride_[c] = c_stride[(size_t) c];
-            const size_t bytes_c = c_weight[(size_t) c] ? (size_t) ((double) pool_bytes_cap *
+            const size_t bytes_c = c_weight[(size_t) c] ? (size_t) g_.n_exp_used * c_stride[(size_t) c] +
+                                                (size_t) ((double) share_b *
                                                 ((double) c_weight[(size_t) c] * (double) c_stride[(size_t) c]) /
                                                 weight_sum) : 0;
             class_slots_[c] = std::min<int64_t>((int64_t) (bytes_c / class_stride_[c]),
@@ -3549,9 +3573,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             off += (size_t) class_slots_[c] * class_stride_[c];
             base += class_slots_[c];
             slots_total += class_slots_[c];
+            every_class = every_class && (c_weight[(size_t) c] == 0 || class_slots_[c] >= g_.n_exp_used);
         }
         pool_bytes_ = off;
-        dev_experts_ = slots_total >= g_.n_exp_used;
+        dev_experts_ = every_class && floor_b <= pool_bytes_cap && slots_total >= g_.n_exp_used;
     }
     if (dev_experts_) {
         cudaError_t e_ = cudaMalloc(&pool_, pool_bytes_);

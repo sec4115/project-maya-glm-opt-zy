@@ -15,13 +15,15 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 import calibrate_ds4_tp as C4  # noqa: E402
 
+C4.usable_cpus = lambda: 88   # (a host with more CPUs than the 44 threads below: the lane leaves some free)
+
 NINE = [24.0] + [16.0] * 8               # a 24 GB GPU and eight 16 GB ones, in the engine's order
 
 
 class FakeEngine:
     """Started with cfg["args"]: decode tok/s = speed(tp, threads), a long prompt's read tok/s = read(tp)."""
 
-    def __init__(self, cfg, speed, read, cpu_experts=100, threads=44):
+    def __init__(self, cfg, speed, read, cpu_experts=100, threads=44, vram=NINE):
         a = cfg["args"]
         self.tp = int(C4.arg(a, "--tp") or 2)   # (the engine's default)
         w = C4.arg(a, "--cpu-threads")
@@ -29,6 +31,16 @@ class FakeEngine:
         self.args = list(a)
         self.speed, self.read = speed, read
         self.info = {"cpu_threads": self.threads, "cpu_experts": cpu_experts}
+        # Model the existing VRAM protocol too: requested TP is not engine telemetry.
+        self.vram = []
+        i = 0
+        while i < len(vram):
+            j = i + 1
+            while j < len(vram) and j - i < self.tp and (self.tp == len(vram) or vram[j] == vram[i]):
+                j += 1
+            width = self.tp if j - i == self.tp else 1
+            self.vram.extend({"dev": dev, "tp_n": width} for dev in range(i, j))
+            i = j
         self.last = {}
 
     def generate(self, ids, max_new, sampling, cancel):
@@ -52,7 +64,7 @@ class Run:
             tp = int(C4.arg(cfg["args"], "--tp") or 2)
             if fail(tp, sum(s[0] == tp for s in self.starts)):    # (n: that --tp's starts so far)
                 raise RuntimeError("the engine exited before it was ready")
-            e = FakeEngine(cfg, speed, read, **kw)
+            e = FakeEngine(cfg, speed, read, vram=vram, **kw)
             self.starts.append((e.tp, C4.arg(cfg["args"], "--cpu-threads")))
             return e
         cfg = {"args": args or ["--pack", "/m/maya-ds4", "--max-context", "65536", "--tp", "2"]}
@@ -67,10 +79,11 @@ READ = {1: 950.0, 2: 908.0, 4: 760.0, 8: 607.0, 9: 500.0}
 class Candidates(unittest.TestCase):
     def test_tp(self):
         self.assertEqual(C4.tp_candidates(NINE), [2, 4, 8, 9])
-        self.assertEqual(C4.tp_candidates([16.0, 16.0]), [2])
+        self.assertEqual(C4.tp_candidates([16.0, 16.0]), [2, 1])   # (#502: the layer split measured too, last)
         self.assertEqual(C4.tp_candidates([24.0]), [])
         self.assertEqual(C4.tp_candidates([24.0, 16.0]), [1, 2])   # (no two alike: each alone, or one group)
-        self.assertEqual(C4.tp_candidates([16.0] * 3), [2, 3])
+        self.assertEqual(C4.tp_candidates([16.0] * 3), [2, 3, 1])
+        self.assertEqual(C4.tp_candidates([24.0] * 4), [2, 4, 1])
         self.assertEqual(C4.tp_candidates([16.0] * 6), [2, 4, 6])
         self.assertEqual(C4.tp_candidates([24.0, 24.0] + [16.0] * 4), [2, 4, 6])
 
@@ -78,6 +91,9 @@ class Candidates(unittest.TestCase):
         self.assertEqual(C4.thread_candidates(44), [33, 22])
         self.assertEqual(C4.thread_candidates(3), [2])
         self.assertEqual(C4.thread_candidates(2), [])
+        # a lane that takes every CPU (#433): 2 and 4 fewer first
+        self.assertEqual(C4.thread_candidates(32, every_cpu=True), [30, 28, 24, 16])
+        self.assertEqual(C4.thread_candidates(4, every_cpu=True), [3, 2])
 
     def test_apply(self):
         a = ["--pack", "/p", "--tp", "2"]
@@ -121,10 +137,21 @@ class Measure(unittest.TestCase):
         self.assertEqual(r.res["args"], {"--tp": 8, "--cpu-threads": 33})
         self.assertEqual(r.starts[4:], [(8, "33"), (8, "22")])
 
-    def test_no_cpu_lane_no_threads(self):
+    def test_no_cpu_lane_reported_threads_still_tested(self):
+        # (#433: a reported 0 skipped the test on a PC whose lane took ~60% of the experts - now one start says)
         r = Run(lambda tp, w: DECODE[tp], cpu_experts=0)
-        self.assertEqual(len(r.starts), 4)
+        self.assertEqual(r.starts[4:], [(8, "33")])
         self.assertEqual(r.res["args"]["--cpu-threads"], None)
+
+    def test_a_lane_on_every_cpu_tries_two_fewer_first(self):
+        saved = C4.usable_cpus
+        C4.usable_cpus = lambda: 44
+        try:
+            r = Run(lambda tp, w: DECODE[tp] * (1.9 if w == 42 else 1.0))
+        finally:
+            C4.usable_cpus = saved
+        self.assertEqual(r.res["args"], {"--tp": 8, "--cpu-threads": 42})
+        self.assertEqual(r.starts[4:6], [(8, "42"), (8, "40")])
 
     def test_one_gpu_only_threads(self):
         r = Run(lambda tp, w: 5.0 * (1.2 if w == 33 else 1.0), vram=[24.0], args=["--pack", "/p", "--tp", "2"])
@@ -141,7 +168,7 @@ class Measure(unittest.TestCase):
     def test_a_config_without_tp_is_the_engines_default(self):
         # (no --tp: the engine's 2 is the baseline - not a --tp 1 start, which reads prompts in windows of 16)
         r = Run(lambda tp, w: DECODE[tp], cpu_experts=0, args=["--pack", "/p"])
-        self.assertEqual([s[0] for s in r.starts], [2, 4, 8, 9])
+        self.assertEqual([s[0] for s in r.starts[:4]], [2, 4, 8, 9])
         self.assertEqual(r.res["report"]["own"]["--tp"], 2)
 
     def test_the_baseline_must_start(self):

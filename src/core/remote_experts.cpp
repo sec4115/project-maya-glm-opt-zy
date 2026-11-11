@@ -6,7 +6,9 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -54,6 +56,19 @@ struct DeviceScope {
     }
 };
 
+// GlmExpertHelper::pending_ held for one use of the helper's stream and buffers (a call from enqueue to wait, or a
+// replace): released at scope exit only when the stream is known to be idle - nothing was queued (idle from the
+// start), or a cudaStreamSynchronize returned cudaSuccess.  Otherwise it stays set (the stream may still read the slots
+// or write the caller's buffer): no enqueue or replace runs until close() has synchronized the stream.  keep: the
+// claim outlives the scope (a queued call, until its wait).
+struct Claim {
+    std::atomic<bool>& flag;
+    bool idle = true, keep = false;
+    ~Claim() {
+        if (idle && !keep) flag.store(false, std::memory_order_release);
+    }
+};
+
 bool check(cudaError_t result, const char* what, std::string& err, int device) {
     if (result == cudaSuccess) return true;
     err = "CUDA" + std::to_string(device) + " experts: " + what + ": " + cudaGetErrorString(result);
@@ -72,7 +87,7 @@ GlmExpertHelper::~GlmExpertHelper() {
 }
 
 bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
-                           const std::vector<std::pair<void*, size_t>>& regions, std::string& err) {
+                           const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3) {
     close();
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
@@ -95,6 +110,11 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     const size_t need = 2 * (size_t) n_embd * sizeof(float) + (size_t) (n_embd + 8 * n_ff) / 32 * 36 + 1024;
     if (!check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "helper stream", err, device) ||
         !check(cudaMalloc((void**) &arena_, need), "helper scratch", err, device)) return false;
+    // EXL3: the stream's kernel scratch now (the first launch would make it), before reserve() sizes the cache
+    if (exl3 && !strata::kernels::exl3::prepare(stream_)) {
+        err = "CUDA" + std::to_string(device) + " experts: the EXL3 kernels' scratch did not allocate";
+        return false;
+    }
     uint8_t* at = arena_;
     const auto take = [&](size_t bytes) {
         void* p = at;
@@ -108,7 +128,34 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     plan_.plan_ptr = (unsigned long long*) take(8 * sizeof(unsigned long long));
     plan_.plan_w = (float*) take(8 * sizeof(float));
     plan_.cpu_flag = (int*) take(64);
-    return check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device);
+    if (!check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device)) return false;
+    // zero-copy on an integrated helper (the Qwen helper's STRATA_REMOTE_ZEROCOPY pattern): its device reads the host's
+    // memory as its own, so the input, the plan and the result stay in one mapped pinned block
+    const char* zc = std::getenv("STRATA_GLM_HELPER_ZEROCOPY");
+    if (integrated_ && !(zc != nullptr && zc[0] == '0')) {
+        const size_t xb = (size_t) n_embd * sizeof(float);
+        void* block = nullptr;
+        if (!check(cudaHostAlloc(&block, 2 * xb + 8 * sizeof(unsigned long long) + 8 * sizeof(float),
+                                 cudaHostAllocPortable | cudaHostAllocMapped), "helper zero-copy block", err, device))
+            return false;
+        zc_host_ = (uint8_t*) block;
+        x_h_ = (float*) zc_host_;
+        out_h_ = (float*) (zc_host_ + xb);
+        plan_ptr_h_ = (unsigned long long*) (zc_host_ + 2 * xb);
+        plan_w_h_ = (float*) (zc_host_ + 2 * xb + 8 * sizeof(unsigned long long));
+        uint8_t* z = nullptr;
+        if (!check(cudaHostGetDevicePointer((void**) &z, block, 0), "helper zero-copy mapping", err, device)) return false;
+        x_z_ = (float*) z;
+        out_z_ = (float*) (z + xb);
+        zplan_ = plan_;
+        zplan_.plan_ptr = (unsigned long long*) (z + 2 * xb);
+        zplan_.plan_w = (float*) (z + 2 * xb + 8 * sizeof(unsigned long long));
+        zero_copy_ = true;
+    }
+    prof_ = std::getenv("STRATA_GLM_PROF") != nullptr;
+    for (auto& e : ev_)
+        if (prof_ && !check(cudaEventCreate(&e), "helper profile event", err, device)) return false;
+    return true;
 }
 
 bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err) {
@@ -155,6 +202,12 @@ bool GlmExpertHelper::insert(int key, const uint8_t* host, size_t bytes, size_t 
 }
 
 bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string& err) {
+    // (the slots a pending call reads, and the helper's stream: wait first; held until this copy has landed)
+    bool free_now = false;
+    if (!pending_.compare_exchange_strong(free_now, true, std::memory_order_acq_rel)) {
+        err = "GLM expert helper: cache replacement while a call is pending"; return false;
+    }
+    Claim claim{pending_};
     if (out < 0 || (size_t) out >= slots_.size() || in < 0 || (size_t) in >= slots_.size() || !owns(out) || owns(in)) {
         err = "GLM expert helper: invalid cache replacement"; return false;
     }
@@ -175,8 +228,12 @@ bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string&
     else {
         DeviceScope scope(device_);
         if (!scope.ok) { err = scope.error(device_); return false; }
-        if (!check(cudaMemcpyAsync(s.device, host, s.bytes, cudaMemcpyHostToDevice, stream_), "cache replace", err, device_) ||
-            !check(cudaStreamSynchronize(stream_), "cache replace finish", err, device_)) return false;
+        if (!check(cudaMemcpyAsync(s.device, host, s.bytes, cudaMemcpyHostToDevice, stream_), "cache replace", err, device_))
+            return false;
+        claim.idle = false;
+        const cudaError_t done = cudaStreamSynchronize(stream_);
+        claim.idle = done == cudaSuccess;
+        if (!check(done, "cache replace finish", err, device_)) return false;
     }
     slots_[(size_t) in] = s;
     slots_[(size_t) out] = {};
@@ -215,8 +272,47 @@ std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint
 bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                               const int* keys, const float* weights, const float* x,
                               float* out, std::string& err) {
+    return start(nullptr, gu_type, d_type, down_off, limit, ne, keys, weights, x, out, err) && finish(err, false);
+}
+
+bool GlmExpertHelper::compute_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                                   const int* keys, const float* weights, const float* x,
+                                   float* out, std::string& err) {
+    return start(&lay, 0, 0, 0, limit, ne, keys, weights, x, out, err) && finish(err, false);
+}
+
+bool GlmExpertHelper::enqueue(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                              const int* keys, const float* weights, const float* x,
+                              float* out, std::string& err) {
+    return start(nullptr, gu_type, d_type, down_off, limit, ne, keys, weights, x, out, err);
+}
+
+bool GlmExpertHelper::enqueue_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                                   const int* keys, const float* weights, const float* x,
+                                   float* out, std::string& err) {
+    return start(&lay, 0, 0, 0, limit, ne, keys, weights, x, out, err);
+}
+
+bool GlmExpertHelper::wait(std::string& err) { return finish(err, true); }
+
+// The first half of a call - xl: an EXL3 pack's layout (compute_exl3), null: native GGUF experts of gu_type / d_type
+// (compute): the input and the plan up, the kernels, and the result's copy into out, all on the helper's stream.  The
+// call holds pending_ from here to its wait (Claim), so no replace or other call overlaps it.  A failure after anything
+// was queued waits for the stream (nothing may land in out later; on the helper's device, current here) and leaves
+// nothing pending - unless that wait failed too (the claim then stays until close()).
+bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off,
+                            float limit, int ne, const int* keys, const float* weights, const float* x,
+                            float* out, std::string& err) {
     namespace gf = strata::kernels::glmf;
-    if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(d_type)) {
+    namespace x3 = strata::kernels::exl3;
+    bool free_now = false;
+    if (!pending_.compare_exchange_strong(free_now, true, std::memory_order_acq_rel)) {
+        err = "GLM expert helper: a call before this one was not waited for, or a cache replacement runs";
+        return false;
+    }
+    Claim claim{pending_};
+    if (device_ < 0 || ne < 1 || ne > 8 ||
+        (xl == nullptr && (!gf::moe_supported(gu_type) || !gf::moe_supported(d_type)))) {
         err = "GLM expert helper: unsupported expert types or route width";
         return false;
     }
@@ -227,31 +323,157 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
         }
         ptr[i] = (unsigned long long) slots_[(size_t) keys[i]].device;
     }
+    size_t bytes = 0;
+    for (int i = 0; i < ne; ++i) bytes += slots_[(size_t) keys[i]].bytes;
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
-    if (!check(cudaMemcpyAsync(x_, x, (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice, stream_),
-               "helper input", err, device_) ||
-        !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
-               "helper pointers", err, device_) ||
-        !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
-               "helper weights", err, device_)) return false;
-    gf::quantize_q8_1(x_, xq_, n_embd_, stream_);
-    gf::moe_gate_up(gu_type, plan_, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
-    gf::moe_down(d_type, plan_, ne, n_embd_, n_ff_, down_off, hq_, nullptr, out_, stream_);
-    return check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
-                 "helper result", err, device_) &&
-           check(cudaStreamSynchronize(stream_), "helper finish", err, device_);
+    const auto t0 = std::chrono::steady_clock::now();
+    // (EXL3: the family's launch failures only print and count - DS4_HELPER's check, around this call's kernels)
+    const int x3_errors = xl != nullptr ? x3::launch_errors() : 0;
+    const auto failed = [&] {   // (err is set)
+        claim.idle = cudaStreamSynchronize(stream_) == cudaSuccess;
+        return false;
+    };
+    if (prof_ && !check(cudaEventRecord(ev_[0], stream_), "helper profile event", err, device_)) return failed();
+    if (zero_copy_) {
+        std::memcpy(x_h_, x, (size_t) n_embd_ * sizeof(float));
+        std::memcpy(plan_ptr_h_, ptr, (size_t) ne * sizeof(ptr[0]));
+        std::memcpy(plan_w_h_, weights, (size_t) ne * sizeof(float));
+    } else if (!check(cudaMemcpyAsync(x_, x, (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice, stream_),
+                      "helper input", err, device_) ||
+               !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
+                      "helper pointers", err, device_) ||
+               !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
+                      "helper weights", err, device_)) return failed();
+    const gf::MoeDev& plan = zero_copy_ ? zplan_ : plan_;
+    if (prof_ && !check(cudaEventRecord(ev_[1], stream_), "helper profile event", err, device_)) return failed();
+    if (xl != nullptr) {
+        // EXL3: gate/up/swiglu and down over the F32 input (no quantize: its stage times 0), the weighted sum in plan
+        // order - the trunk's own decode call (glm_fast_path.cu's fast_moe_experts) without the CPU part and the
+        // shared expert; h in the stream's scratch
+        x3::MoeArgs xa;
+        xa.plan_ptr = plan.plan_ptr;
+        xa.plan_w = plan.plan_w;
+        xa.lay = *xl;
+        xa.k = ne;
+        xa.n_embd = n_embd_;
+        xa.n_ff = n_ff_;
+        xa.limit = limit;
+        if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return failed();
+        x3::moe_gate_up(xa, zero_copy_ ? x_z_ : x_, nullptr, stream_);
+        if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return failed();
+        x3::moe_down(xa, nullptr, nullptr, zero_copy_ ? out_z_ : out_, stream_);
+    } else {
+        gf::quantize_q8_1(zero_copy_ ? x_z_ : x_, xq_, n_embd_, stream_);
+        if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return failed();
+        gf::moe_gate_up(gu_type, plan, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
+        if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return failed();
+        gf::moe_down(d_type, plan, ne, n_embd_, n_ff_, down_off, hq_, nullptr, zero_copy_ ? out_z_ : out_, stream_);
+    }
+    if (prof_ && !check(cudaEventRecord(ev_[4], stream_), "helper profile event", err, device_)) return failed();
+    if (!zero_copy_ && !check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+                              "helper result", err, device_)) return failed();
+    if (prof_ && !check(cudaEventRecord(ev_[5], stream_), "helper profile event", err, device_)) return failed();
+    pend_ = Pending{xl != nullptr, x3_errors, ne, bytes, out, t0, std::chrono::steady_clock::now()};
+    claim.keep = true;   // (finish() releases it)
+    return true;
+}
+
+// The second half: wait for the stream, then the EXL3 launch check, the zero-copy result's copy and the profile.
+// split: a caller's own wait (enqueue / wait) - the time between the two halves counts apart (the caller's work
+// beside the helper), not as waiting.  The call's claim on pending_ is released on the way out, only once the stream
+// has been synchronized: nothing is pending afterwards, whatever the outcome - unless no synchronize succeeded (the
+// claim then stays until close(), and out may still be written).
+bool GlmExpertHelper::finish(std::string& err, bool split) {
+    namespace x3 = strata::kernels::exl3;
+    if (!pending_.load(std::memory_order_acquire)) {
+        err = "GLM expert helper: nothing to wait for";
+        return false;
+    }
+    Claim claim{pending_, false};   // (this call's, taken in start(): released when the stream is idle)
+    const Pending p = pend_;
+    DeviceScope scope(device_);
+    if (!scope.ok) {
+        // The helper's device could not be made current, yet nothing of this call may land in out (or read a slot)
+        // once the caller has seen it fail: synchronize the stream from the device that is current.  A stream belongs
+        // to the device (context) it was made on, and synchronizing it waits on that context whichever is current -
+        // the multi-device rules restrict kernel launches and cudaEventRecord to the stream's device, not waits (cf.
+        // cudaEventSynchronize / cudaStreamWaitEvent across devices; cuStreamSynchronize takes no context).  Should
+        // that wait fail all the same, the claim stays: no enqueue or replace touches the stream until close().
+        claim.idle = cudaStreamSynchronize(stream_) == cudaSuccess;
+        err = scope.error(device_);
+        return false;
+    }
+    const auto tw = split ? std::chrono::steady_clock::now() : p.t1;
+    const cudaError_t done = cudaStreamSynchronize(stream_);
+    claim.idle = done == cudaSuccess;
+    if (!check(done, "helper finish", err, device_)) return false;
+    if (p.exl3 && x3::launch_errors() != p.x3_errors) {
+        err = "CUDA" + std::to_string(device_) + " experts: the helper's EXL3 kernels did not run (exl3 launch errors " +
+              std::to_string(p.x3_errors) + " -> " + std::to_string(x3::launch_errors()) + ")";
+        return false;
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    if (zero_copy_) std::memcpy(p.out, out_h_, (size_t) n_embd_ * sizeof(float));   // (the result's copy, on the host)
+    const auto t3 = std::chrono::steady_clock::now();
+    last_gpu_ms_ = -1.0;
+    if (prof_) {
+        float ms[5] = {};
+        for (int k = 0; k < 5; ++k)
+            if (!check(cudaEventElapsedTime(&ms[k], ev_[k], ev_[k + 1]), "helper profile timing", err, device_)) return false;
+        last_gpu_ms_ = 0.0;
+        for (int k = 0; k < 5; ++k) stage_ms_[k] += ms[k], last_gpu_ms_ += ms[k];
+        enqueue_ms_ += std::chrono::duration<double, std::milli>(p.t1 - p.t0).count();
+        wait_ms_ += std::chrono::duration<double, std::milli>(t2 - tw).count();
+        out_ms_ += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        ++calls_;
+        experts_ += (unsigned long long) p.ne;
+        bytes_ += (unsigned long long) p.bytes;
+        if (split) {
+            ++split_calls_;
+            beside_ms_ += std::chrono::duration<double, std::milli>(tw - p.t1).count();
+        }
+    }
+    return true;
 }
 
 void GlmExpertHelper::close() {
     if (device_ < 0) return;
+    if (prof_ && calls_ > 0) {
+        const double n = (double) calls_, kernels_ms = stage_ms_[2] + stage_ms_[3];
+        std::fprintf(stderr, "glm helper prof CUDA%d: %llu calls, %.2f experts a call, zero-copy %s: host %.3f ms a call "
+                             "(enqueue %.3f, wait %.3f, result copy %.3f); GPU copy-in %.3f, quantize %.3f, gate_up %.3f, down "
+                             "%.3f, copy-out %.3f ms a call; the experts' bytes over gate_up + down at %.1f GB/s\n",
+                     device_, calls_, (double) experts_ / n, zero_copy_ ? "on" : "off", (enqueue_ms_ + wait_ms_ + out_ms_) / n,
+                     enqueue_ms_ / n, wait_ms_ / n, out_ms_ / n, stage_ms_[0] / n, stage_ms_[1] / n, stage_ms_[2] / n,
+                     stage_ms_[3] / n, stage_ms_[4] / n, kernels_ms > 0.0 ? (double) bytes_ / (kernels_ms * 1e6) : 0.0);
+        if (split_calls_ > 0)   // (enqueue / wait: the caller's own work ran between the two halves)
+            std::fprintf(stderr, "glm helper prof CUDA%d: %llu of the calls split (enqueue, the caller's work, wait): %.3f ms "
+                                 "a split call between the two halves\n",
+                         device_, split_calls_, beside_ms_ / (double) split_calls_);
+    }
     DeviceScope scope(device_);
     if (scope.ok) {
         if (stream_) cudaStreamSynchronize(stream_);
         if (arena_) cudaFree(arena_);
         if (pool_) cudaFree(pool_);
         if (stream_) cudaStreamDestroy(stream_);
+        for (auto& e : ev_)
+            if (e) cudaEventDestroy(e);
+        if (zc_host_) cudaFreeHost(zc_host_);
     }
+    zero_copy_ = prof_ = false;
+    zc_host_ = nullptr;
+    x_h_ = out_h_ = x_z_ = out_z_ = plan_w_h_ = nullptr;
+    plan_ptr_h_ = nullptr;
+    zplan_ = {};
+    for (auto& e : ev_) e = nullptr;
+    calls_ = experts_ = bytes_ = split_calls_ = 0;
+    enqueue_ms_ = wait_ms_ = out_ms_ = beside_ms_ = 0;
+    last_gpu_ms_ = -1.0;
+    pending_.store(false, std::memory_order_release);
+    pend_ = {};
+    for (auto& v : stage_ms_) v = 0;
     device_ = -1;
     arena_ = nullptr;
     pool_ = nullptr;

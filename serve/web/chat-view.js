@@ -28,7 +28,7 @@ function Meter() {
 
 function ModelMenu({open, close, anchor}) {
   const h = S.health, preset = presetOf(P), c = ctxMeter();
-  useEffect(() => { if (open && h.capabilities?.models && !MS.data) loadModels(); }, [open, h.capabilities?.models]);   // (the Models row says how many are set up)
+  useEffect(() => { if (open && !MS.data) loadModels(); }, [open]);   // (the Models row says how many are set up)
   const go = (s) => () => { close(); openSettings(s); };
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Model" align="left" cls="model-menu" width=${340}>
     <div class="model-menu__card"><${ModelLogo} model=${h.model} size=${36}/>
@@ -40,9 +40,9 @@ function ModelMenu({open, close, anchor}) {
     <button type="button" role="menuitem" class="menu__item" onClick=${go("chat")}><span class="menu__label">Sampling</span>
       <span class="menu__sub">${preset ? PRESET_NAMES[preset] : "Custom"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
     <${MenuSep}/>
-    ${h.capabilities?.models ? html`<button type="button" role="menuitem" class="menu__item" onClick=${() => { close(); showView("models"); }}>
+    <button type="button" role="menuitem" class="menu__item" onClick=${() => { close(); showView("models"); }}>
       <span class="menu__label">Models</span><span class="menu__sub">${MS.data ? `${MS.data.models.length} set up` : "Switch, settings"}</span>
-      <${Icon} name="chevron" sm cls="chev is-closed"/></button>` : null}
+      <${Icon} name="chevron" sm cls="chev is-closed"/></button>
   <//>`;
 }
 
@@ -91,7 +91,8 @@ function UserMsg({m, i}) {
   return html`<div class="you" data-id=${m.id}>
     ${(m.files || []).length || (m.images || []).length ? html`<div class="you__files">
       ${(m.files || []).map((f) => html`<span class="chip"><${Icon} name="attach" sm/>${f.name}</span>`)}
-      ${(m.images || []).map((im) => im.url ? html`<img src=${im.url} alt=${im.name || "picture"}/>`
+      ${(m.images || []).map((im) => im.url ? (im.kind === "video" ? html`<video src=${im.url} controls preload="metadata" aria-label=${im.name || "video"}></video>`
+                                                                     : html`<img src=${im.url} alt=${im.name || "picture"}/>`)
                                             : html`<span class="chip"><${Icon} name="image" sm/>${im.name || "picture"}</span>`)}</div>` : null}
     ${m.text ? html`<div class="you__bubble">${m.text}</div>` : null}
     <div class="you__actions"><span class="you__time">${m.time ? timeStr(m.time) : ""}</span>
@@ -387,7 +388,7 @@ function Composer({center}) {
         <span class="anchor">
           <button type="button" ref=${thinkBtn} class=${`think-chip${think ? " is-open" : ""}`} aria-haspopup="dialog" aria-expanded=${String(think)}
             aria-label=${`Thinking: ${lv.name}. Change it`} title="How long the model thinks" onClick=${() => setThink(!think)}>
-            <${Gauge} level=${level}/><span>${lv.name}</span></button>
+            <${Gauge} level=${level}/><span><span class="think-chip__word">Thinking · </span><b>${lv.name}</b></span></button>
         </span>
         ${mine ? html`<button type="button" class="send send--stop" aria-label="Stop the answer (Esc)" title="Stop (Esc)" onClick=${stopAnswer}>
                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></button>`
@@ -419,8 +420,8 @@ function ModelCard({phone}) {
     let facts = [last && last.decode_tok_s ? `${fmt(last.decode_tok_s, last.decode_tok_s < 10 ? 1 : 0)} tok/s` : null,
                  sv && sv.priced ? `${usd(sv.usd)} saved` : null].filter(Boolean);
     if (!facts.length && h.max_context) facts = [`${ctxfmt(h.max_context)} context`];
-    return html`<button type="button" class="model-card model-card--phone" onClick=${() => h.capabilities?.models ? showView("models") : openSettings("model")}
-        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. ${h.capabilities?.models ? "Switch model" : "Model settings"}`}>
+    return html`<button type="button" class="model-card model-card--phone" onClick=${() => showView("models")}
+        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. Switch model`}>
       <${ModelLogo} model=${h.model} size=${40}/>
       <span class="model-card__text"><span class="model-card__name"><b>${name}</b></span>
         <span class="model-card__line num"><span class="model-card__state" data-tone=${ready ? "ok" : st.tone}><i></i>${state}</span>${
@@ -437,7 +438,7 @@ function ModelCard({phone}) {
       <div class="model-card__name" role="status"><b title=${h.model || ""}>${name}</b>${pill}</div>
       ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${k}<b>${v}</b></span>`)}</div>` : null}
     </div>
-    ${h.capabilities?.models ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>` : null}
+    <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>
   </section>`;
 }
 

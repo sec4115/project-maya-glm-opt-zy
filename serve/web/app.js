@@ -26,13 +26,13 @@ function App() {
     const want = S.view === "monitor" ? "#monitor" : S.view === "models" ? "#models" : S.settings ? "#settings" : "";
     if (location.hash !== want) history.replaceState(null, "", want || location.pathname + location.search);
   });
-  const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" && S.health.capabilities?.models ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`;
+  const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`;
   return html`<div class=${`shell${S.sideOpen && !phone ? "" : " shell--closed"}`}>
     ${phone ? html`<${PhonePush} page=${page}/>` : S.sideOpen ? html`<${Sidebar}/>` : null}
     ${phone ? null : page}
     ${S.settings ? html`<${SettingsDialog}/>` : null}
     ${S.search ? html`<${SearchDialog}/>` : null}
-    ${S.savedSheet && phone && S.health.capabilities?.savings ? html`<${SavedSheet}/>` : null}
+    ${S.savedSheet && phone ? html`<${SavedSheet}/>` : null}
     <${DialogHost}/>
     <${Toasts}/>
   </div>`;
@@ -113,7 +113,7 @@ render(html`<${App}/>`, document.getElementById("app"));
 route();
 whenHealth(() => updateCtxMeter());
 loadChats().then(() => { if (S.view === "chat" && !S.settings) focusInput(); return loadHealth(); }).then(loadMcp).then(() => {
-  if (S.health.capabilities?.turbo) loadTurbo();                                     // (the Turbo button: on or off)
+  loadTurbo();                                     // (the Turbo button: on or off)
   loadUpdate();                                    // (Settings' dot when a new version is out)
   resumePending(true);
   if (startQuestion) {

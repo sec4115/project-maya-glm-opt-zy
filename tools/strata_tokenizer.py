@@ -100,6 +100,19 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
+# The `minimax` pre-tokenizer: MiniMax-M3.1's tokenizer.json verbatim - an NFC normalizer, then one Split (invert,
+# "Removed") with this regex, GPT-4o's (o200k) - before the byte-level map.  The NFC runs on each plain segment,
+# between the added tokens, as `tokenizers` does for added tokens that are not normalized.
+MINIMAX_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 class _IsolatedSplits:
     """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
 
@@ -136,8 +149,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3" % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
+                             % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -158,7 +172,9 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
+                    regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
+        self._nfc = pre == "minimax"
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -265,6 +281,9 @@ class Tokenizer:
     def _encode_plain(self, text: str) -> list[int]:
         memo = self._piece_memo
         out: list[int] = []
+        if self.__dict__.get("_nfc"):
+            import unicodedata
+            text = unicodedata.normalize("NFC", text)
         for piece in self._re.findall(text):
             with self._cache_lock:
                 hit = memo.get(piece)
@@ -332,6 +351,10 @@ class Tokenizer:
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
+
+        KEEP IN STEP: serve/server.py's PromptMemo._encode (MAYA_PROMPT_MEMO) runs a copy of this loop over a prompt's
+        tail, using `_special_re`, `special_tokens` and `_encode_segment`; a change here must be made there too
+        (serve/test_prompt_memo.py checks that both give the same ids).
 
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
