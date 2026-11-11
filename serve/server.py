@@ -52,7 +52,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve import ds4_vision, gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, images_of,
-                            literal_tags, mark_literals, openai_to_messages, unmark_literals)
+                            literal_tags, LiteralMemo, mark_literals, openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -131,6 +131,171 @@ QUEUE_WARN_S = 60.0
 
 
 # ------------------------------------------------------------------------------------------------ engines
+import bisect  # noqa: E402  (MAYA_PROMPT_MEMO: the prompt memo's block bisection)
+
+
+def prompt_memo_on() -> bool:
+    """On unless MAYA_PROMPT_MEMO=0 (v1.1.55 #813: the same token ids, a long agent turn prepared faster)."""
+    return os.environ.get("MAYA_PROMPT_MEMO", "1") != "0"
+
+
+def common_prefix(a: str, b: str, block: int = 1 << 16) -> int:
+    """The length of a's and b's common start: equal blocks by memcmp, the first unequal block in halves."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i:i + block] == b[i:i + block]:
+        i += block
+    if i >= n:
+        return n
+    lo, hi = i, min(i + block, n)   # (a[:lo] == b[:lo]; a[:hi] != b[:hi], or hi == n)
+    while hi - lo > 1:
+        m = (lo + hi) // 2
+        if a[lo:m] == b[lo:m]:
+            lo = m
+        else:
+            hi = m
+    return lo + (1 if lo < n and a[lo] == b[lo] else 0)
+
+
+class PromptMemo:
+    """The marked prompt's literals and ids by increment (MAYA_PROMPT_MEMO), the same ids as unmark_literals and
+    tok.encode over the whole prompt.  A new prompt starts as one of the last few: what comes before its last
+    special token that surely is one in both is taken from there, and only the rest is unmarked and encoded.
+    Why it is the same: encode splits at the special tokens the regex finds left to right and each piece between two is
+    encoded alone; up to a token ending at least `longest` characters before the first difference the regex sees the
+    same characters, so it finds the same tokens, and goes on from there as a run over the tail alone does.  The
+    marks (the literals inside messages, which stay text) come from the marked prompt, compared as it is."""
+
+    def __init__(self, tok, literals: dict[str, str], keep: int = 4):
+        self.tok, self.marks, self.keep = tok, {v: k for k, v in literals.items()}, keep
+        self.pat = getattr(tok, "_special_re", None)
+        self.longest = max((len(s) for s in getattr(tok, "special_tokens", None) or ()), default=0)
+        self.entries = []   # the newest last
+        self.lock = threading.Lock()
+        self.mark_re = None
+        if self.marks:
+            self.mark_re = re.compile("[" + "".join(map(re.escape, self.marks)) + "]")
+
+    def usable(self) -> bool:
+        return self.pat is not None and hasattr(self.tok, "_encode_segment")
+
+    def _unmark(self, marked: str, m_at: int, t_at: int):
+        """marked (from position m_at in the marked prompt, t_at in the text) -> its text, its marks' positions in the
+        marked prompt, their spans in the text."""
+        out, mpos, spans, pos, n = [], [], [], 0, t_at
+        for m in self.mark_re.finditer(marked) if self.mark_re is not None else ():
+            out.append(marked[pos:m.start()])
+            n += m.start() - pos
+            tag = self.marks[m.group(0)]
+            out.append(tag)
+            mpos.append(m_at + m.start())
+            spans.append((n, n + len(tag)))
+            n += len(tag)
+            pos = m.end()
+        out.append(marked[pos:])
+        return "".join(out), mpos, spans
+
+    def _encode(self, text: str, at: int, spans):
+        """Tokenizer._encode_matching's loop over text (at: its position in the whole, spans in the whole's places),
+        with where each emitted token ends -> ids, [(end in the whole, len(ids) there), ...]."""
+        out, cuts, pos, tok = [], [], 0, self.tok
+        it = iter(spans)
+        upcoming = next(it, None)
+        plain_end = 0
+        for m in self.pat.finditer(text):
+            start = m.start()
+            while upcoming is not None and upcoming[0] - at <= start:
+                plain_end = max(plain_end, upcoming[1] - at)
+                upcoming = next(it, None)
+            if start < plain_end:
+                continue
+            if start > pos:
+                out.extend(tok._encode_segment(text[pos:start]))
+            out.append(tok.special_tokens[m.group(0)])
+            pos = m.end()
+            cuts.append((at + pos, len(out)))
+        if pos < len(text):
+            out.extend(tok._encode_segment(text[pos:]))
+        return out, cuts
+
+    def encode(self, marked: str, changed: bool) -> list[int]:
+        with self.lock:
+            best, best_l = None, 0
+            for e in self.entries:
+                l = common_prefix(e["marked"], marked)
+                # (a prompt whose first literal just appeared, or whose last just went, starts as one of the other kind
+                #  too: both read the same text up to the first mark character, whichever of them is unmarked)
+                if e["changed"] != changed:
+                    if self.mark_re is None:
+                        continue
+                    if e["changed"]:
+                        l = min(l, e["mpos"][0]) if e["mpos"] else l
+                    else:
+                        for ch in self.marks:   # (str.find per mark: this class's regex takes a microsecond a character)
+                            i = e["marked"].find(ch, 0, l)
+                            l = i if i >= 0 else l
+                if l >= best_l:
+                    best, best_l = e, l
+            use, n_ids, m_at, t_at, c_sp, c_cut = None, 0, 0, 0, 0, 0
+            if best is not None:
+                mpos, spans, cuts = best["mpos"], best["spans"], best["cuts"]
+                # the first difference in the text's places
+                c = bisect.bisect_left(mpos, best_l)
+                t_l = best_l if c == 0 else spans[c - 1][1] + (best_l - mpos[c - 1] - 1)
+                # the last token that ended `longest` before it, whose end no span of plain text lies across
+                k = bisect.bisect_right(cuts, (t_l - self.longest, 1 << 62)) - 1
+                while k >= 0:
+                    b = cuts[k][0]
+                    c_sp = bisect.bisect_right(spans, (b, -1))       # (the spans starting before b)
+                    if c_sp == 0 or spans[c_sp - 1][1] <= b:
+                        break
+                    k -= 1
+                if k >= 0:
+                    use, n_ids, c_cut = best, cuts[k][1], k + 1
+                    t_at = cuts[k][0]
+                    # the marked prompt's position of t_at: back over the marks before it
+                    m_at = t_at if c_sp == 0 else mpos[c_sp - 1] + 1 + (t_at - spans[c_sp - 1][1])
+            if use is None:
+                text, mpos2, spans2 = self._unmark(marked, 0, 0) if changed else (marked, [], [])
+                ids, cuts2 = self._encode(text, 0, spans2)
+                entry = dict(marked=marked, changed=changed, text=text, mpos=mpos2, spans=spans2, cuts=cuts2, ids=ids)
+            else:
+                tail_m = marked[m_at:]
+                t_text, t_mpos, t_spans = self._unmark(tail_m, m_at, t_at) if changed else (tail_m, [], [])
+                t_ids, t_cuts = self._encode(t_text, t_at, t_spans)
+                entry = dict(marked=marked, changed=changed, text=use["text"][:t_at] + t_text,
+                             mpos=use["mpos"][:c_sp] + t_mpos, spans=use["spans"][:c_sp] + t_spans,
+                             cuts=use["cuts"][:c_cut] + [(a, b + n_ids) for a, b in t_cuts],
+                             ids=use["ids"][:n_ids] + t_ids)
+            self.entries = [e for e in self.entries if e is not use and e["marked"] != marked][-(self.keep - 1):] + [entry]
+            return list(entry["ids"])
+
+
+def join_ids_memo(memo: dict, ids, block: int = 4096) -> str:
+    """','.join of ids (MAYA_PROMPT_MEMO), the blocks that start as the last prompt's taken from its string.
+    The result is always exactly ','.join of the ids: the reused head is taken from the last string only where
+    the ids' blocks compare equal, so a mismatched or interleaved memo just falls back to the plain join."""
+    ids = [int(t) for t in ids] if not isinstance(ids, list) else ids
+    last, text, offs = memo.get("ids", ()), memo.get("text", ""), memo.get("offs", ())
+    k = 0
+    while k < len(offs) and (k + 1) * block <= min(len(ids), len(last)) and \
+            ids[k * block:(k + 1) * block] == last[k * block:(k + 1) * block]:
+        k += 1
+    head, new_offs = text[:offs[k - 1]] if k else "", list(offs[:k])
+    parts, at = [head] if k else [], len(head)
+    for i in range(k * block, len(ids), block):
+        s = ",".join(map(str, map(int, ids[i:i + block])))
+        if at:
+            s = "," + s
+        parts.append(s)
+        at += len(s)
+        if i + block <= len(ids):
+            new_offs.append(at)
+    out = "".join(parts)
+    memo.update(ids=list(ids), text=out, offs=new_offs)
+    return out
+
+
 class Engine(Protocol):
     max_context: int
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
@@ -918,7 +1083,10 @@ class StrataEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            if prompt_memo_on():
+                self.proc.stdin.write(f"{head} {join_ids_memo(self.__dict__.setdefault('_join_memo', {}), ids)}\n")
+            else:
+                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -1041,7 +1209,10 @@ class StrataEngine:
         done = False
         try:
             try:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                if prompt_memo_on():
+                    self.proc.stdin.write(f"{head} {join_ids_memo(self.__dict__.setdefault('_join_memo', {}), ids)}\n")
+                else:
+                    self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
                 self.proc.stdin.flush()
             except OSError:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -1582,13 +1753,32 @@ class Service:
         """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
         tokenized.  A special token's text inside a message or a tool is encoded as that text; only the literals the
         template (or the suffix) writes are special tokens."""
-        marked, marked_tools, changed = mark_literals(messages, tools, self.literals)
+        memo = prompt_memo_on()
+        if memo:
+            if getattr(self, "_lit_memo", None) is None:
+                self._lit_memo = LiteralMemo(self.literals)
+                self._prompt_memo = PromptMemo(self.tok, self.literals)
+            marked, marked_tools, changed = self._lit_memo.mark_literals(messages, tools)
+        else:
+            marked, marked_tools, changed = mark_literals(messages, tools, self.literals)
         prompt = self.template.render(marked, tools=marked_tools, **kwargs)
         if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
             # GLM-5.3's template opens the thinking block whatever it is told (no enable_thinking, and an effort it
             # does not know means 'max'): with thinking off the answer was written inside an open <think>.  Close
             # it empty, the form the same template writes for a past turn that did not think.
             prompt += "</think>"
+        if memo and not suffix and self._prompt_memo.usable():
+            ids = self._prompt_memo.encode(prompt, changed)
+            if os.environ.get("MAYA_PROMPT_MEMO") == "verify":   # (the whole way too: a test's, every prompt)
+                if changed:
+                    p2, plain = unmark_literals(prompt, self.literals)
+                    full = self.tok.encode(p2, parse_special=True, plain=plain)
+                else:
+                    full = self.tok.encode(prompt, parse_special=True)
+                if full != ids:
+                    raise RuntimeError("MAYA_PROMPT_MEMO: the ids differ from the whole prompt's")
+                print(f"[maya] prompt memo verified: {len(ids)} ids", flush=True)
+            return ids
         if not changed:
             return self.tok.encode(prompt + suffix, parse_special=True)
         prompt, plain = unmark_literals(prompt, self.literals)
@@ -3993,7 +4183,8 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
-              "STRATA_SERVER_LOG", "STRATA_PREFIX_CANONICAL_TOOLS", "STRATA_GLM_THINK_RESERVE") + RESPONSE_ENV_KEYS
+              "STRATA_SERVER_LOG", "STRATA_PREFIX_CANONICAL_TOOLS", "STRATA_GLM_THINK_RESERVE",
+              "MAYA_PROMPT_MEMO") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:

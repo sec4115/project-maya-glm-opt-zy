@@ -118,7 +118,9 @@ class ApiHttp(unittest.TestCase):
         self.assertEqual(self.svc.history[-1]["thinking_budget"], 1024)
         self.assertGreaterEqual(self.svc.history[-1]["queue_ms"], 0)
         self.post("/v1/messages", self.body())
-        self.assertEqual(self.engine.sampling["_think_budget"], 6144)
+        # default budget = max_new - reserve - 1: reserve = max(max_new//4, min(1024, max_new//2))
+        # = 2048 for max_new=8192, and the forced think-close token consumes one more (upstream v1.1.56-7 formula)
+        self.assertEqual(self.engine.sampling["_think_budget"], 6143)
 
     def test_disabled_thinking_sends_no_budget(self):
         req = self.body()
