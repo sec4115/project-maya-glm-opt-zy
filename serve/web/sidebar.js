@@ -1,13 +1,13 @@
 // serve/web/sidebar.js - the sidebar (new chat, search, Models, Monitor, Settings; the chats: pinned, in folders, then by day;
 // the model's status and what it saved against its API), a chat's ⋯ menu, and the search dialog.
 import {html, useEffect, useLayoutEffect, useMemo, useRef, useState} from "./preact.js";
-import {MOD, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
+import {MOD, SUPPORT_URL, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
 import {S, confirmDialog, emit, toast} from "./state.js";
 import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
 import {Icon, Kbd, MayaMark, Menu, MenuItem, MenuLabel, MenuSep, ModelLogo, trapTab, useDismiss} from "./ui.js";
 
-export const showView = (v) => { S.view = v === "models" && !S.health.capabilities?.models ? "chat" : v; S.drawer = false; emit(); };
+export const showView = (v) => { S.view = v; S.drawer = false; emit(); };
 export const openSettings = (section = "general") => { S.settings = section; S.drawer = false; emit(); };
 export const setSide = (open) => { S.sideOpen = open; store.set("side-open", open); emit(); };
 
@@ -249,7 +249,7 @@ function SavedLine() {
   const sv = S.metrics && S.metrics.savings;
   const [open, setOpen] = useState(false);
   const btn = useRef(null);
-  if (!S.health.capabilities?.savings || !sv || !sv.priced) return null;
+  if (!sv || !sv.priced) return null;
   const phone = isPhone();
   const toggle = () => {
     if (phone) { S.drawer = false; S.savedSheet = true; emit(); return; }   // (a phone: the sheet, over the page)
@@ -270,11 +270,15 @@ function StatusCard() {
   const name = S.health.model_label || modelName(S.health.model);
   return html`<div class="side__foot">
     <${SavedLine}/>
+    <div class="status-row">
     <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${`${name}, ${st.text}. Open the Monitor`}>
       <${ModelLogo} model=${S.health.model}/>
       <span class="status-card__text"><b title=${S.health.model}>${name}</b>
         <span class=${`status status--${st.tone}`}><i class="status__dot"></i>${st.text}</span></span>
-    </button></div>`;
+    </button>
+    ${/* a quiet way to support Maya, beside the model's name: a link, never a popup */ ""}
+    <a class="icon-btn icon-btn--sm heart-link" href=${SUPPORT_URL} target="_blank" rel="noopener" aria-label="Support Maya" title="Support Maya">
+      <${Icon} name="heart" sm/></a></div></div>`;
 }
 
 // drawer: the phone's chats (app.js's PhonePush), in the page whether open or not - shut, nothing in them is reached
@@ -305,8 +309,8 @@ export function Sidebar({drawer, open}) {
     <button type="button" class="nav-item" onClick=${newChat}><${Icon} name="new-chat"/><span>New chat</span><${Kbd} k=${`${MOD} ⇧ O`}/></button>
     <button type="button" class="nav-item" onClick=${() => { S.search = true; S.drawer = false; emit(); }}>
       <${Icon} name="search"/><span>Search chats</span><${Kbd} k=${`${MOD} K`}/></button>
-    ${S.health.capabilities?.models ? html`<button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
-      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>` : null}
+    <button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
+      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>
     <button type="button" class=${`nav-item${S.view === "monitor" ? " is-current" : ""}`} aria-current=${S.view === "monitor" ? "page" : undefined}
       onClick=${() => showView("monitor")}><${Icon} name="activity"/><span>Monitor</span></button>
     <button type="button" class="nav-item" onClick=${() => openSettings(newer ? "about" : "general")}>

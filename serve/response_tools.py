@@ -16,8 +16,13 @@ def expand_request(request: dict) -> tuple[dict, dict[str, tuple[str | None, str
     def name_of(name, namespace=None):
         if not isinstance(name, str) or not name:
             raise ValueError("client tools require a nonempty name")
-        if namespace is not None and (not isinstance(namespace, str) or not namespace):
-            raise ValueError("tool namespace requires a nonempty name")
+        if namespace is not None:
+            # A namespace is one path segment: no separators inside (upstream v1.1.56's contract; ours uses
+            # __ to qualify names, so "__" would make a qualified name ambiguous too).
+            if not isinstance(namespace, str) or not namespace:
+                raise ValueError("tool namespace requires a nonempty name")
+            if "::" in namespace or "__" in namespace:
+                raise ValueError("a namespace name must not contain a separator")
         return f"{namespace}__{name}" if namespace else name
 
     for tool in tools or []:
@@ -26,6 +31,8 @@ def expand_request(request: dict) -> tuple[dict, dict[str, tuple[str | None, str
         if tool.get("type") == "namespace":
             ns = tool.get("name")
             name_of(ns)
+            if isinstance(ns, str) and ("::" in ns or "__" in ns):
+                raise ValueError("a namespace name must not contain a separator")
             children = tool.get("tools")
             if not isinstance(children, list):
                 raise ValueError("namespace.tools must be an array")

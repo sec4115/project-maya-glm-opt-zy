@@ -185,8 +185,11 @@ struct DsaPrepArgs {
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// score[p] = sum_h relu(iq_h . pooled_p) * iw_h for the n_pools completed pools.
+/// token: a decode token (fast_dsa, a decode row) - only it takes the take-two kernel STRATA_GLM_DSA_SCORE2 names (a
+/// prompt's windows keep the original: their per-token calls run beside the expert copies; glm_attn_bench's override
+/// applies anywhere); the scores are the same bits either way.
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
-               float* score, cudaStream_t s);
+               float* score, cudaStream_t s, bool token = false);
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
@@ -217,8 +220,16 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
 /// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
+/// marks (the stage profiler, MAYA_GLM_PROF): called after each step it launched with that step's name -
+/// "mla_q_abs", "mla_attend", "mla_out", or "mla" for the one-kernel form; nullptr: none.  Launches unchanged.
+struct MlaMarks {
+    void (*fn)(void* ctx, const char* name);
+    void* ctx;
+};
+/// token: the decode's token path - only it takes the take-two split attention STRATA_GLM_MLA_ATTN2 names (as dsa_score).
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false);
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
+         const MlaMarks* marks = nullptr, bool token = false);
 /// The same absorbed MLA in three steps for a verify window (each step mla()'s arithmetic, bit for bit): the head-wise
 /// q_abs = wk_b . q of `ncol` tokens at once (q rows q_stride floats apart, q_abs rows qa_stride), one token's attention
 /// over its selected cells into ctx (n_head x kv_lora; false: not available here - use mla()), and the head-wise
@@ -288,6 +299,8 @@ struct MoeDev {
     unsigned int* dcnt = nullptr;              // ... [n_keys] routes per key (halved every 4096 routes): the coldest
                                                //     RAM-tier experts go to the host, the hot ones are promoted
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
+    int* route_err_d = nullptr;                // ... and its device copy, which the route kernel reads (a read of the
+                                               //     host-mapped one crossed PCIe at every route's start); null: none
     const int* skip = nullptr;                 // set_skip's flag: non-zero = the experts' kernels do nothing
     // moe_experts_multi: mt_T tokens in one launch, token t's plan at plan_ptr / plan_w + 8 t and its rows at these
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
@@ -334,6 +347,13 @@ struct MoeResponse {
     volatile unsigned int seq;
     unsigned int ptr_mask;            // plan entries the host made resident: ptr[i] valid
     unsigned long long ptr[8];
+    // STRATA_GLM_STREAM_FETCH=1: entries in stream_mask were posted before their disk reads finished; ready[i] gets
+    // bit (part * s_chunks + chunk) as each chunk lands in ptr[i] (fast_read_part's layout: gate 0, up s_gu, down
+    // 2 s_gu), and the fetch kernels copy each chunk once its bit is set (zephel01/Abyss d626d96, mw00 #570)
+    unsigned int stream_mask;
+    unsigned int ready[8];
+    unsigned long long s_gu, s_dn;
+    int s_chunks;
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
     unsigned long long upd_val[64];
@@ -349,7 +369,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0, int win = 0,
                unsigned int* scr_used = nullptr, int win_n = 0, int disk_skip_from = 8, float disk_skip_w = 0.0f,
-               float miss_skip_w = 0.0f, int win_rows = 0);
+               float miss_skip_w = 0.0f, int win_rows = 0, bool resident_ok = true);
 /// A verify window's MoE layer with each distinct expert computed ONCE: the T tokens were routed one after another into
 /// their own plan arrays (moe_route with win = t and a scr_used word, so no two of them land in one scratch slot - the
 /// word's bit 31 says one did), then moe_win_experts groups the entries by expert slot, reads each expert's gate/up and
@@ -391,6 +411,10 @@ void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
 void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s);
 /// The side stream's copy of the prefetch list (pf_src -> pf_dst, pf_n entries of blob_bytes each).
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
+/// STRATA_GLM_PF_CE: need = (this route prefetched anything) ? its seq : 0 - read after the route, on its stream
+void moe_pf_need(const MoeDev& d, unsigned int* need, cudaStream_t s);
+/// STRATA_GLM_PF_CE: hold the stream until flag reaches need (no-op for need 0; gives up after ~25 s)
+void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
@@ -445,8 +469,12 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 /// Q6_K or 8 = Q8_0), dequantized as ggml's to_float does (the same floats).  n_embd % 256 == 0.
 void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s);
 /// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
-/// map[i - map_from] (a draft head's gathered rows -> their token ids).
+/// map[i - map_from] (a draft head's gathered rows -> their token ids).  No finite value among the n (#860): *out is
+/// 0 - a valid id, map[] never read - and the current device's argmax_nonfinite() count goes up.
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
+/// How many argmax calls on the current device found no finite value since the process started (a synchronous read
+/// of a device word: call it with the device idle, never per token).  0 on a read error.
+unsigned argmax_nonfinite();
 /// argmax over x[0..n) with its value: out[0] the index (0x7fffffff when nothing is finite), out[1] the value's bits.
 void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// The pick of a row split in two at c0 from both halves' argmax_pair (b's index relative to c0): argmax's for the
