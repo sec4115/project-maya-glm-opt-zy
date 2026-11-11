@@ -2868,6 +2868,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         mark(5);
         if (lprof) g_lane_prof.add(ne, lt);
         return;
+    }
 
     std::vector<float> pipeline_reference;
     static const bool pipeline = [] {

@@ -2346,7 +2346,6 @@ static int glm_pack_generate(const Options& o) {
             }
             return produced < max_new;
         };
-        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
         if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.lookup_draft_cap() > 0 && req_spec != 1) {
             int64_t n_lookup = 0;
             if (!model.decode_lookup(sp, prompt, max_new, on_token, n_lookup, err)) {
@@ -2354,7 +2353,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
             // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
             // below for the same samples); --spec T caps a round's window at T tokens
             int64_t n_spec = 0;
@@ -3250,6 +3249,7 @@ static int glm_pack_generate(const Options& o) {
     // pipelined decode (and every request with a token to feed issued first).  Errors end the running requests.
     bool step_no_spec = false;   // (between a prompt's pieces: the speculative stint runs until input comes - not there)
     const auto multi_step = [&] {
+        std::vector<float> lg;
         // (a PAUSE in the last read's gaps: its snapshot, once no request waits for its first token)
         if (!deferred_pauses.empty() && !in_read_gap && admitting_rid.load() < 0 &&
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
